@@ -3,17 +3,23 @@ import { it, expect, jest } from '@jest/globals';
 jest.setTimeout(30000);
 
 /**
- * Conditional test helper — runs tests only when a real PostgreSQL database
+ * Conditional test helper: runs tests only when a real PostgreSQL database
  * is reachable. In CI without a DB service, the tests are skipped.
+ *
+ * The probe pool is closed even when the DB is up: with DB_POOL_MIN > 0 it
+ * keeps its idle connection forever and the Jest worker never exits.
  */
 async function withDb(then: () => Promise<void>): Promise<void> {
-  const { query } = await import('../db/connection.js');
+  jest.resetModules();
+  const { query, closePool } = await import('../db/connection.js');
   try {
     await query('SELECT 1');
-    await then();
   } catch {
-    // database not available — skip
+    return; // database not available, skip
+  } finally {
+    await closePool();
   }
+  await then();
 }
 
 describe('Database connection pool', () => {
@@ -33,7 +39,7 @@ describe('Database connection pool', () => {
       jest.resetModules();
       const { getClient, closePool } = await import('../db/connection.js');
 
-      // Acquire the only connection — pool is now saturated.
+      // Acquire the only connection; the pool is now saturated.
       const client = await getClient();
 
       // A second acquire should reject within connectionTimeoutMillis.

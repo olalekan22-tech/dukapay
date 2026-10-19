@@ -16,7 +16,14 @@ import logger from '../utils/logger.js';
 import { cacheService } from '../services/cacheService.js';
 import { notificationService } from '../services/notificationService.js';
 import { invalidateOnRepay, invalidateOnLoanRequest } from '../utils/cacheKeys.js';
-import { roundToCents } from '../money/decimal.js';
+import {
+  amountToStroops,
+  roundDiv,
+  roundToCents,
+  stroopsToAmount,
+  toWholeStroops,
+} from '../money/decimal.js';
+import { eventAmountFields } from '../money/eventAmounts.js';
 import { sanitizeHtml } from '../utils/sanitize.js';
 
 interface LoanTermConfig {
@@ -257,6 +264,8 @@ type BorrowerLoan = {
   accruedInterest: number | null;
   totalRepaid: number;
   totalOwed: number | null;
+  /** Approved rate, or the configured default when the event lacks one. */
+  interestRateBps: number;
   nextPaymentDeadline: string;
   status: 'active' | 'repaid' | 'defaulted' | 'pending_indexing';
   borrower: string;
@@ -439,7 +448,7 @@ export const buildRepaymentPreviewSchedule = (
 
 /**
  * GET /api/loans/:id/repayment-preview
- * Returns exact repayment schedule before committing — amortization table with
+ * Returns exact repayment schedule before committing: amortization table with
  * principal, interest, fees, remaining balance per period.
  */
 export const getLoanRepaymentPreview = asyncHandler(async (req: Request, res: Response) => {
@@ -471,7 +480,7 @@ export const getLoanRepaymentPreview = asyncHandler(async (req: Request, res: Re
     throw AppError.notFound('Loan not fully approved', ErrorCode.LOAN_NOT_FOUND, 'loanId');
   }
 
-  const principal = Number.parseFloat(String(requestEvent.amount));
+  const principal = stroopsToAmount(String(requestEvent.amount));
   const interestRateBps = Number.parseInt(
     String(approvalEvent.interest_rate_bps ?? loanTermConfig.defaultInterestRateBps),
     10,
@@ -568,7 +577,8 @@ export const getBorrowerLoans = asyncHandler(async (req: Request, res: Response)
           CASE 
             WHEN approved_ledger IS NULL OR approved_ledger = 0 OR $2 < approved_ledger THEN 'pending_indexing'
             WHEN is_defaulted = 1 THEN 'defaulted'
-            WHEN (principal + accrued_interest - total_repaid) > 0.01 THEN 'active'
+            -- Amounts are stroops: anything from one stroop up is still owed.
+            WHEN (principal + accrued_interest - total_repaid) >= 1 THEN 'active'
             ELSE 'repaid'
           END as status
         FROM loan_fin
@@ -590,8 +600,9 @@ export const getBorrowerLoans = asyncHandler(async (req: Request, res: Response)
     borrower,
     currentLedger,
     status && status !== 'all' ? status : null,
-    amountRange?.min ?? null,
-    amountRange?.max ?? null,
+    // amount_range is in whole tokens; principal is stored in stroops.
+    amountRange ? amountToStroops(amountRange.min).toString() : null,
+    amountRange ? amountToStroops(amountRange.max).toString() : null,
     effectiveDateRange?.start ?? null,
     effectiveDateRange?.end ?? null,
     cursorValue,
@@ -609,12 +620,11 @@ export const getBorrowerLoans = asyncHandler(async (req: Request, res: Response)
     const isPending = row.status === 'pending_indexing';
     return {
       loanId: Number(row.loan_id),
-      principal: Number.parseFloat((row.principal as string) || '0'),
-      accruedInterest: isPending
-        ? null
-        : Number.parseFloat((row.accrued_interest as string) || '0'),
-      totalRepaid: Number.parseFloat((row.total_repaid as string) || '0'),
-      totalOwed: isPending ? null : Number.parseFloat((row.total_owed as string) || '0'),
+      principal: stroopsToAmount(row.principal as string | null),
+      accruedInterest: isPending ? null : stroopsToAmount(row.accrued_interest as string | null),
+      totalRepaid: stroopsToAmount(row.total_repaid as string | null),
+      totalOwed: isPending ? null : stroopsToAmount(row.total_owed as string | null),
+      interestRateBps: Number(row.effective_rate_bps),
       nextPaymentDeadline: new Date(row.next_payment_deadline as string).toISOString(),
       status: row.status as 'active' | 'repaid' | 'defaulted' | 'pending_indexing',
       borrower: row.address as string,
@@ -700,11 +710,12 @@ export const getLoanDetails = asyncHandler(async (req: Request, res: Response) =
     (event: Record<string, unknown>) => event.event_type === 'LoanRepaid',
   );
 
-  const principal = Number.parseFloat(requestEvent?.amount || '0');
+  // Settlement math in stroops; converted to whole tokens in the response.
+  const principal = toWholeStroops(requestEvent?.amount);
   const totalRepaid = repaymentEvents.reduce(
-    (sum: number, event: Record<string, unknown>) =>
-      sum + Number.parseFloat((event.amount as string) || '0'),
-    0,
+    (sum: bigint, event: Record<string, unknown>) =>
+      sum + toWholeStroops(event.amount as string | null),
+    0n,
   );
 
   const rateBps = approvalEvent?.interest_rate_bps || loanTermConfig.defaultInterestRateBps;
@@ -742,18 +753,18 @@ export const getLoanDetails = asyncHandler(async (req: Request, res: Response) =
   const isPending = approvedLedger <= 0 || currentLedger < approvedLedger;
 
   const accruedInterest = isPending
-    ? 0
-    : (principal * rateBps * elapsedLedgers) / (10000 * termLedgers);
+    ? 0n
+    : roundDiv(principal * BigInt(rateBps) * BigInt(elapsedLedgers), 10000n * BigInt(termLedgers));
   const totalOwed = principal + accruedInterest - totalRepaid;
 
   res.json({
     success: true,
     loanId,
     summary: {
-      principal,
-      accruedInterest: isPending ? null : accruedInterest,
-      totalRepaid,
-      totalOwed: isPending ? null : totalOwed,
+      principal: stroopsToAmount(principal),
+      accruedInterest: isPending ? null : stroopsToAmount(accruedInterest),
+      totalRepaid: stroopsToAmount(totalRepaid),
+      totalOwed: isPending ? null : stroopsToAmount(totalOwed),
       interestRate: rateBps / 10000,
       termLedgers,
       elapsedLedgers,
@@ -761,14 +772,14 @@ export const getLoanDetails = asyncHandler(async (req: Request, res: Response) =
         ? 'pending_indexing'
         : isDefaulted
           ? 'defaulted'
-          : totalOwed > 0.01
+          : totalOwed > 0n
             ? 'active'
             : 'repaid',
       requestedAt: requestEvent?.ledger_closed_at,
       approvedAt: approvalEvent?.ledger_closed_at,
       events: events.map((event: Record<string, unknown>) => ({
         type: event.event_type,
-        amount: event.amount,
+        ...eventAmountFields(event.event_type, event.amount),
         timestamp: event.ledger_closed_at,
         tx: event.tx_hash,
       })),
@@ -806,7 +817,7 @@ export const getLoanAmortizationSchedule = asyncHandler(async (req: Request, res
     throw AppError.notFound('Loan not fully approved', ErrorCode.LOAN_NOT_FOUND, 'loanId');
   }
 
-  const principal = Number.parseFloat(String(requestEvent.amount));
+  const principal = stroopsToAmount(String(requestEvent.amount));
   const interestRateBps = Number.parseInt(
     String(approvalEvent.interest_rate_bps ?? loanTermConfig.defaultInterestRateBps),
     10,
@@ -838,9 +849,10 @@ export const getLoanAmortizationSchedule = asyncHandler(async (req: Request, res
  * POST /api/loans/request
  */
 export const requestLoan = asyncHandler(async (req: Request, res: Response) => {
-  const { amount, borrowerPublicKey } = req.body as {
+  const { amount, borrowerPublicKey, termLedgers } = req.body as {
     amount: number;
     borrowerPublicKey: string;
+    termLedgers: number;
   };
 
   if (borrowerPublicKey !== req.user?.publicKey) {
@@ -859,7 +871,8 @@ export const requestLoan = asyncHandler(async (req: Request, res: Response) => {
     const poolBalance = await (
       sorobanService as unknown as { getPoolBalance: () => Promise<number> }
     ).getPoolBalance();
-    if (amount > poolBalance) {
+    // Pool balance is in stroops; the request is in whole tokens.
+    if (amountToStroops(amount) > BigInt(poolBalance)) {
       throw AppError.badRequest(
         'Insufficient pool liquidity to cover this loan',
         ErrorCode.INSUFFICIENT_BALANCE,
@@ -867,8 +880,8 @@ export const requestLoan = asyncHandler(async (req: Request, res: Response) => {
     }
   }
 
-  // Idempotency: return existing unsigned tx if recently built for this borrower/amount
-  const cacheKey = `pending_loan_tx:${borrowerPublicKey}:${amount}`;
+  // Idempotency: return existing unsigned tx if recently built for this borrower/amount/term
+  const cacheKey = `pending_loan_tx:${borrowerPublicKey}:${amount}:${termLedgers}`;
   const cachedTx = await cacheService.get<{
     unsignedTxXdr: string;
     networkPassphrase: string;
@@ -887,7 +900,11 @@ export const requestLoan = asyncHandler(async (req: Request, res: Response) => {
     return;
   }
 
-  const result = await sorobanService.buildRequestLoanTx(borrowerPublicKey, amount);
+  const result = await sorobanService.buildRequestLoanTx(
+    borrowerPublicKey,
+    amountToStroops(amount),
+    termLedgers,
+  );
 
   // Cache for 60 seconds to prevent sequence number collisions from rapid requests
   await cacheService.set(cacheKey, result, 60);
@@ -952,7 +969,11 @@ export const repayLoan = asyncHandler(async (req: Request, res: Response) => {
     return;
   }
 
-  const result = await sorobanService.buildRepayTx(borrowerPublicKey, loanIdNum, amount);
+  const result = await sorobanService.buildRepayTx(
+    borrowerPublicKey,
+    loanIdNum,
+    amountToStroops(amount),
+  );
 
   // Cache for 60 seconds
   await cacheService.set(cacheKey, result, 60);
@@ -1021,7 +1042,7 @@ export const depositCollateral = asyncHandler(async (req: Request, res: Response
   const result = await sorobanService.buildDepositCollateralTx(
     borrowerPublicKey,
     loanIdNum,
-    amount,
+    amountToStroops(amount),
   );
 
   await cacheService.set(cacheKey, result, 60);
@@ -1146,7 +1167,7 @@ export const refinanceLoan = asyncHandler(async (req: Request, res: Response) =>
   const result = await sorobanService.buildRefinanceLoanTx(
     borrowerPublicKey,
     loanIdNum,
-    newAmount,
+    amountToStroops(newAmount),
     newTerm,
   );
 

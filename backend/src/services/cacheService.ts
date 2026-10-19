@@ -174,7 +174,7 @@ return 0
    * @returns true if the key existed and the value matched (key deleted),
    *          false if the key was absent or the value did not match.
    */
-  async deleteIfMatch(key: string, expectedValue: string): Promise<boolean> {
+  async deleteIfMatch(key: string, expectedValue: unknown): Promise<boolean> {
     try {
       await this.ensureConnected();
       const result = await this.client!.eval(CacheService.COMPARE_AND_DELETE_SCRIPT, {
@@ -223,10 +223,15 @@ return 0
   }
 
   async close(): Promise<void> {
-    if (this.isConnected && this.client) {
+    if (!this.client?.isOpen) return;
+    // A client that never reached Redis is still open and retrying; quit()
+    // would wait for it, so destroy() stops the reconnect loop instead.
+    if (this.client.isReady) {
       await this.client.quit();
-      this.isConnected = false;
+    } else {
+      this.client.destroy();
     }
+    this.isConnected = false;
   }
 }
 

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { useTranslations } from "next-intl";
+import { useLocale, useTranslations } from "next-intl";
 import { ArrowLeft } from "lucide-react";
 import { RemittanceForm } from "../../components/remittance/RemittanceForm";
 import { useWalletStore, selectIsWalletConnected } from "../../stores/useWalletStore";
@@ -13,6 +13,7 @@ const FAQ_KEYS = ["address", "duration", "fees", "creditScore", "wrongAddress"] 
 export default function SendRemittancePage() {
   const t = useTranslations("SendRemittance");
   const router = useRouter();
+  const locale = useLocale();
   const isConnected = useWalletStore(selectIsWalletConnected);
   const [isSubmitted, setIsSubmitted] = useState(false);
 
@@ -20,7 +21,7 @@ export default function SendRemittancePage() {
     setIsSubmitted(true);
     // Redirect to remittances page after 2 seconds
     setTimeout(() => {
-      router.push("/remittances");
+      router.push(`/${locale}/remittances`);
     }, 2000);
   };
 
@@ -92,21 +93,6 @@ export default function SendRemittancePage() {
             </div>
           </div>
         </ErrorBoundary>
-
-        {/* Footer Links */}
-        <div className="mt-12 pt-6 border-t border-zinc-200 dark:border-zinc-800 text-center">
-          <p className="text-sm text-zinc-600 dark:text-zinc-400">
-            {t("needHelp")}
-            <a
-              href="https://t.me/+eRqhka27TVo0NzM8"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="ml-1 text-indigo-600 dark:text-indigo-400 hover:text-indigo-700 dark:hover:text-indigo-300 focus-visible:ring-2 focus-visible:ring-focus-ring rounded px-1"
-            >
-              {t("contactSupport")}
-            </a>
-          </p>
-        </div>
       </div>
     </div>
   );

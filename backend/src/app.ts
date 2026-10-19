@@ -1,12 +1,12 @@
+// First import so .env is loaded before any module reads process.env.
+import 'dotenv/config';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import cors from 'cors';
 import compression from 'compression';
 import helmet from 'helmet';
-import dotenv from 'dotenv';
 import { Sentry } from './config/sentry.js';
 import { mountSwaggerDocs } from './config/swagger.js';
 
-dotenv.config();
 import pool from './db/connection.js';
 import { cacheService } from './services/cacheService.js';
 import { sorobanService } from './services/sorobanService.js';
@@ -165,8 +165,8 @@ app.get('/', (_req: Request, res: Response) => {
  * backend version deployed can be determined without shelling into the container.
  *
  * Environment variables (injected at Docker build time via ARG/ENV):
- *   GIT_SHA    — full git commit SHA of the build (falls back to "unknown")
- *   BUILD_TIME — ISO-8601 UTC timestamp of the build (falls back to "unknown")
+ *   GIT_SHA     full git commit SHA of the build (falls back to "unknown")
+ *   BUILD_TIME  ISO-8601 UTC timestamp of the build (falls back to "unknown")
  */
 app.get('/version', (_req: Request, res: Response) => {
   res.json({
@@ -372,7 +372,7 @@ const statusRouter = express.Router();
 registerStatusRoutes(statusRouter);
 app.use('/', statusRouter);
 
-// Legacy routes (deprecated, maintained for backward compatibility)
+// API routes
 app.use('/api', simulationRoutes);
 app.use('/api/score', scoreRoutes);
 app.use('/api/loans', loanRoutes);
@@ -386,25 +386,9 @@ app.use('/api/events', eventRoutes);
 app.use('/api/remittances', remittanceRoutes);
 app.use('/api/transactions', transactionRoutes);
 app.use('/api/agents', agentFloatRoutes);
-app.use('/audit', auditRoutes);
-
-// Versioned API routes (v1 - current)
-app.use('/api/v1', simulationRoutes);
-app.use('/api/v1/score', scoreRoutes);
-app.use('/api/v1/loans', loanRoutes);
-app.use('/api/v1/indexer', indexerRoutes);
-app.use('/api/v1/admin', adminRoutes);
-app.use('/api/v1/auth', authRoutes);
-app.use('/api/v1/agents', agentRoutes);
-app.use('/api/v1/remittances', remittanceRoutes);
-app.use('/api/v1/transactions', transactionRoutes);
-app.use('/api/v1/pool', poolRoutes);
-app.use('/api/v1/notifications', notificationsRoutes);
-app.use('/api/v1/events', eventRoutes);
-app.use('/api/v1/privacy', privacyRoutes);
-app.use('/api/v1/agents', agentFloatRoutes);
-app.use('/api/v1/audit', auditRoutes);
-app.use('/user', userRoutes);
+app.use('/api/privacy', privacyRoutes);
+app.use('/api/audit', auditRoutes);
+app.use('/api/user', userRoutes);
 
 mountSwaggerDocs(app);
 

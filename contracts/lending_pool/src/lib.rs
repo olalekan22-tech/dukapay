@@ -45,6 +45,7 @@ pub enum PoolError {
     CallDepthExceeded = 19,
     ReentrancyGuardTriggered = 20,
     CircuitBreakerTripped = 21,
+    Unauthorized = 22,
 }
 
 /// Storage keys.
@@ -52,7 +53,7 @@ pub enum PoolError {
 /// v2 replaces the accumulator-style keys (Deposit, RewardDebt, ClaimableYield,
 /// AccYieldPerDeposit, UnclaimedYieldPool) with a share-based (LP-token) model.
 /// Yield is now implicit in the exchange rate between shares and underlying
-/// assets — no separate accumulation or claim step is required.
+/// assets; no separate accumulation or claim step is required.
 ///
 /// All per-token keys carry the token address so one contract instance can
 /// serve multiple token liquidity pools.
@@ -64,6 +65,7 @@ pub enum DataKey {
     /// Optional address of the DukaPay CircuitBreaker contract. When set, the
     /// pool consults it before executing value-moving operations.
     CircuitBreaker,
+    LoanManager,
     WithdrawalCooldown,
     /// token → max pool size cap (0 = unlimited)
     MaxPoolSize(Address),
@@ -81,7 +83,7 @@ pub enum DataKey {
     /// token → internally tracked total assets (idle + outstanding) backing
     /// outstanding shares. This is the sole input to share pricing
     /// (`calc_shares_to_mint` / `calc_assets_to_redeem`) and is mutated only
-    /// by `deposit`, `redeem`/`withdraw`, and `distribute_yield`. It is
+    /// by `deposit`, `redeem`/`withdraw`, and loan accounting callbacks. It is
     /// never derived from `token::Client::balance`, so an unsolicited
     /// direct transfer to the pool's address ("donation") cannot move the
     /// share price.
@@ -186,7 +188,7 @@ impl LendingPool {
     /// ledger by transferring tokens directly to the pool's address,
     /// without going through `deposit`/`redeem`. It is mutated
     /// only by `deposit` (+amount), `redeem`/`withdraw` (-assets_to_return),
-    /// and `distribute_yield` (+amount) — never by `adjust_outstanding`,
+    /// and `distribute_yield` (+amount), never by `adjust_outstanding`,
     /// since moving principal between "idle" and "outstanding" does not
     /// change the total value under management.
     fn total_managed_assets(env: &Env, token: &Address) -> i128 {
@@ -290,6 +292,11 @@ impl LendingPool {
             }
         }
         Ok(())
+    }
+
+    fn loan_manager(env: &Env) -> Option<Address> {
+        Self::bump_instance_ttl(env);
+        env.storage().instance().get(&DataKey::LoanManager)
     }
 
     // ── Reentrancy Guard (CEI + nonReentrant) ───────────────────────────────
@@ -437,7 +444,7 @@ impl LendingPool {
 
         let cur_total_shares = Self::total_shares(env, token);
         // Pricing is derived from internally tracked accounting, never from
-        // the live token balance — see `total_managed_assets`.
+        // the live token balance; see `total_managed_assets`.
         let total_managed_before = Self::total_managed_assets(env, token);
         let assets_to_return =
             Self::calc_assets_to_redeem(shares, total_managed_before, cur_total_shares);
@@ -539,6 +546,67 @@ impl LendingPool {
             .set(&DataKey::Version, &Self::CURRENT_VERSION);
         Self::bump_instance_ttl(&env);
         Ok(())
+    }
+
+    fn require_loan_manager(env: &Env) -> Result<(), PoolError> {
+        let loan_manager = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::LoanManager)
+            .ok_or(PoolError::NotInitialized)?;
+        loan_manager.require_auth();
+        Ok(())
+    }
+
+    /// Recognize interest and fees already transferred into the pool by the
+    /// configured loan manager. Principal repayments are conversions of an
+    /// existing loan receivable and do not change net assets.
+    pub fn record_loan_yield(env: Env, token: Address, amount: i128) {
+        Self::require_loan_manager(&env).unwrap_or_else(|_| panic!("unauthorized loan manager"));
+        if amount < 0 {
+            panic!("invalid loan yield");
+        }
+        if amount == 0 {
+            return;
+        }
+        let updated = Self::total_managed_assets(&env, &token)
+            .checked_add(amount)
+            .expect("total managed assets overflow");
+        Self::set_total_managed_assets(&env, &token, updated);
+        Self::bump_instance_ttl(&env);
+        yield_distributed(&env, token.clone(), amount);
+        price_updated(
+            &env,
+            token.clone(),
+            env.ledger().sequence(),
+            updated,
+            Self::total_shares(&env, &token),
+        );
+    }
+
+    /// Write off an irrecoverable loan-principal loss reported by the loan
+    /// manager, reducing share NAV without relying on raw token balances.
+    pub fn record_loan_loss(env: Env, token: Address, amount: i128) {
+        Self::require_loan_manager(&env).unwrap_or_else(|_| panic!("unauthorized loan manager"));
+        if amount < 0 {
+            panic!("invalid loan loss");
+        }
+        if amount == 0 {
+            return;
+        }
+        let updated = Self::total_managed_assets(&env, &token)
+            .checked_sub(amount)
+            .filter(|assets| *assets >= 0)
+            .expect("loan loss exceeds managed assets");
+        Self::set_total_managed_assets(&env, &token, updated);
+        Self::bump_instance_ttl(&env);
+        price_updated(
+            &env,
+            token.clone(),
+            env.ledger().sequence(),
+            updated,
+            Self::total_shares(&env, &token),
+        );
     }
 
     pub fn version(env: Env) -> u32 {
@@ -681,7 +749,7 @@ impl LendingPool {
 
         // Snapshot pool state *before* the transfer so the share price
         // reflects internally tracked accounting, never the live token
-        // balance — see `total_managed_assets`.
+        // balance; see `total_managed_assets`.
         let total_managed_before = Self::total_managed_assets(&env, &token);
         let cur_total_shares = Self::total_shares(&env, &token);
 
@@ -913,7 +981,7 @@ impl LendingPool {
     ///
     /// The redemption value is derived from internally tracked accounting
     /// (`total_managed_assets`), which automatically includes any yield
-    /// realized via `distribute_yield` since the shares were minted — no
+    /// realized via `distribute_yield` since the shares were minted, with no
     /// separate claim step is required.
     ///
     /// `min_assets_out` is the caller's slippage bound: if the computed
@@ -1132,7 +1200,7 @@ impl LendingPool {
             return Ok(());
         }
 
-        // #1356: delta must be added, not subtracted — a positive delta means
+        // #1356: delta must be added, not subtracted: a positive delta means
         // outstanding debt grew (e.g. a new disbursement), a negative delta
         // means it shrank (e.g. a repayment). Subtracting inverted both cases.
         let key = DataKey::TotalOutstanding(token.clone());
@@ -1152,6 +1220,44 @@ impl LendingPool {
 
     pub fn pool_balance(env: Env, token: Address) -> i128 {
         Self::read_pool_balance(&env, &token)
+    }
+
+    /// Configure the address authorized to call `disburse` (the loan_manager).
+    /// Admin only.
+    pub fn set_loan_manager(env: Env, loan_manager: Address) {
+        Self::admin(&env).require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::LoanManager, &loan_manager);
+        Self::bump_instance_ttl(&env);
+    }
+
+    pub fn get_loan_manager(env: Env) -> Option<Address> {
+        Self::loan_manager(&env)
+    }
+
+    /// Transfer `amount` of `token` from the pool to `to`. Only the
+    /// configured loan_manager may trigger this. The pool authorizes the
+    /// transfer itself via `current_contract_address`, so the loan_manager
+    /// does not need to hold the funds or authorize the token transfer.
+    pub fn disburse(env: Env, to: Address, token: Address, amount: i128) -> Result<(), PoolError> {
+        let loan_manager = Self::loan_manager(&env).ok_or(PoolError::Unauthorized)?;
+        loan_manager.require_auth();
+        Self::assert_not_paused(&env)?;
+        Self::assert_circuit_ok(&env, symbol_short!("disburse"))?;
+
+        if amount <= 0 {
+            return Err(PoolError::InvalidAmount);
+        }
+
+        let idle_balance = Self::read_pool_balance(&env, &token);
+        if amount > idle_balance {
+            return Err(PoolError::InsufficientLiquidity);
+        }
+
+        TokenClient::new(&env, &token).transfer(&env.current_contract_address(), &to, &amount);
+
+        Ok(())
     }
 
     /// Commit a settlement transaction commitment hash to prevent front-running/MEV.
@@ -1219,46 +1325,6 @@ impl LendingPool {
             (Symbol::new(&env, "SettlementRevealed"), settler, token),
             amount,
         );
-        Ok(())
-    }
-
-    /// Enter cross-contract execution with Reentrancy Guard & Call Depth checks (max 3).
-    pub fn enter_cross_contract_call(env: &Env) -> Result<(), PoolError> {
-        let current_depth: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CallDepth)
-            .unwrap_or(0);
-        if current_depth >= 3 {
-            return Err(PoolError::CallDepthExceeded);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::ReentrancyLock, &true);
-        env.storage()
-            .instance()
-            .set(&DataKey::CallDepth, &(current_depth + 1));
-        Ok(())
-    }
-
-    /// Exit cross-contract execution and reset call depth counter.
-    pub fn exit_cross_contract_call(env: &Env) -> Result<(), PoolError> {
-        let current_depth: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::CallDepth)
-            .unwrap_or(0);
-        let next_depth = current_depth
-            .checked_sub(1)
-            .ok_or(PoolError::ReentrancyGuardTriggered)?;
-        env.storage()
-            .instance()
-            .set(&DataKey::CallDepth, &next_depth);
-        if next_depth == 0 {
-            env.storage()
-                .instance()
-                .set(&DataKey::ReentrancyLock, &false);
-        }
         Ok(())
     }
 }

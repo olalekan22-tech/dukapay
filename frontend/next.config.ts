@@ -16,7 +16,7 @@ const withSerwist = withSerwistInit({
 // (Now handled in middleware.ts for nonce-based CSP)
 
 // Next.js dev mode (webpack and Turbopack alike) executes hot-reloaded
-// module chunks via eval() — without 'unsafe-eval' the dev bundle can't run
+// module chunks via eval(); without 'unsafe-eval' the dev bundle can't run
 // at all, so nothing hydrates. Production builds don't need it.
 // (Now handled in middleware.ts)
 
@@ -24,7 +24,6 @@ const withSerwist = withSerwistInit({
 // <script> tags (self.__next_f.push(...), self.__next_r, etc.) on every
 // render, dev and prod alike. We now use a nonce-based CSP via middleware
 // to secure these hydration scripts without relying on 'unsafe-inline'.
-
 
 const nextConfig: NextConfig = {
   reactCompiler: true,

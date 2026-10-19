@@ -8,11 +8,7 @@
   "servers": [
     {
       "url": "/api",
-      "description": "Legacy API base path"
-    },
-    {
-      "url": "/api/v1",
-      "description": "Versioned API base path"
+      "description": "API base path"
     }
   ],
   "components": {
@@ -166,7 +162,8 @@
                   "type": "string"
                 },
                 "amount": {
-                  "type": "number"
+                  "type": "number",
+                  "description": "Whole tokens for money events; raw value otherwise."
                 },
                 "loanId": {
                   "type": "string",
@@ -417,8 +414,20 @@
             "type": "string"
           },
           "amount": {
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "nullable": true,
+            "description": "Money events: whole tokens (e.g. 250.5 USDC). Config events (rates, ledgers, scores): the raw on-chain value."
+          },
+          "amountStroops": {
             "type": "string",
-            "nullable": true
+            "description": "Exact amount in stroops (10^-7 token). Money events only."
           },
           "timestamp": {
             "type": "string",
@@ -1351,7 +1360,20 @@
             "type": "string"
           },
           "amount": {
-            "type": "string"
+            "oneOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "nullable": true,
+            "description": "Money events: whole tokens (e.g. 250.5 USDC). Config events (rates, ledgers, scores): the raw on-chain value."
+          },
+          "amountStroops": {
+            "type": "string",
+            "description": "Exact amount in stroops (10^-7 token). Money events only."
           },
           "ledger": {
             "type": "integer"
@@ -3507,7 +3529,7 @@
             "description": "Invalid log ID."
           },
           "401": {
-            "description": "Unauthorised — missing or invalid API key."
+            "description": "Unauthorised (missing or invalid API key)."
           },
           "404": {
             "description": "Audit proof not found."
@@ -4318,8 +4340,8 @@
                 ],
                 "properties": {
                   "amount": {
-                    "type": "integer",
-                    "minimum": 1,
+                    "type": "number",
+                    "description": "Loan amount in whole tokens (e.g. USDC), up to 7 decimal places",
                     "example": 10000
                   },
                   "termDays": {
@@ -4923,7 +4945,7 @@
     "/loans/request": {
       "post": {
         "summary": "Build an unsigned loan request transaction",
-        "description": "Builds an unsigned Soroban `request_loan(borrower, amount)` transaction XDR. The frontend signs it with the user's wallet and submits via POST /api/loans/submit.\n",
+        "description": "Builds an unsigned Soroban `request_loan(borrower, amount, term)` transaction XDR. The frontend signs it with the user's wallet and submits via POST /api/loans/submit.\n",
         "tags": [
           "Loans"
         ],
@@ -4940,17 +4962,23 @@
                 "type": "object",
                 "required": [
                   "amount",
-                  "borrowerPublicKey"
+                  "borrowerPublicKey",
+                  "termLedgers"
                 ],
                 "properties": {
                   "amount": {
                     "type": "number",
-                    "description": "Loan amount requested",
+                    "description": "Loan amount requested in whole tokens (e.g. USDC), up to 7 decimal places",
                     "example": 1000
                   },
                   "borrowerPublicKey": {
                     "type": "string",
                     "description": "Borrower's Stellar public key (must match JWT)"
+                  },
+                  "termLedgers": {
+                    "type": "integer",
+                    "description": "Loan term in ledgers (about 17280 per day)",
+                    "example": 518400
                   }
                 }
               }
@@ -5012,8 +5040,8 @@
                 ],
                 "properties": {
                   "amount": {
-                    "type": "integer",
-                    "description": "Amount of collateral to deposit"
+                    "type": "number",
+                    "description": "Amount of collateral to deposit in whole tokens (e.g. USDC), up to 7 decimal places"
                   },
                   "borrowerPublicKey": {
                     "type": "string",
@@ -5134,8 +5162,8 @@
                 ],
                 "properties": {
                   "newAmount": {
-                    "type": "integer",
-                    "description": "New loan principal amount"
+                    "type": "number",
+                    "description": "New loan principal amount in whole tokens (e.g. USDC), up to 7 decimal places"
                   },
                   "newTerm": {
                     "type": "integer",
@@ -5374,7 +5402,7 @@
                 "properties": {
                   "amount": {
                     "type": "number",
-                    "description": "Repayment amount",
+                    "description": "Repayment amount in whole tokens (e.g. USDC), up to 7 decimal places",
                     "example": 500
                   },
                   "borrowerPublicKey": {
@@ -6077,7 +6105,7 @@
                   },
                   "amount": {
                     "type": "number",
-                    "description": "Amount to deposit",
+                    "description": "Amount to deposit in whole tokens (e.g. USDC), up to 7 decimal places",
                     "example": 1000
                   }
                 }
@@ -6139,7 +6167,7 @@
                   },
                   "amount": {
                     "type": "number",
-                    "description": "Amount (shares) to withdraw",
+                    "description": "Pool shares to withdraw, up to 7 decimal places (same scale as the token)",
                     "example": 500
                   }
                 }
@@ -6201,7 +6229,7 @@
                   },
                   "shares": {
                     "type": "number",
-                    "description": "Amount (shares) to withdraw"
+                    "description": "Pool shares to withdraw, up to 7 decimal places (same scale as the token)"
                   }
                 }
               }
@@ -6458,6 +6486,24 @@
         }
       }
     },
+    "/privacy/dsar/pending": {
+      "get": {
+        "summary": "List pending DSAR requests (admin only)",
+        "tags": [
+          "Privacy"
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of pending DSARs"
+          }
+        }
+      }
+    },
     "/privacy/dsar/{dsarId}": {
       "get": {
         "summary": "Check DSAR request status",
@@ -6485,24 +6531,6 @@
           },
           "404": {
             "description": "DSAR not found"
-          }
-        }
-      }
-    },
-    "/privacy/dsar/pending": {
-      "get": {
-        "summary": "List pending DSAR requests (admin only)",
-        "tags": [
-          "Privacy"
-        ],
-        "security": [
-          {
-            "ApiKeyAuth": []
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "List of pending DSARs"
           }
         }
       }
@@ -6844,78 +6872,6 @@
         }
       }
     },
-    "/score/leaderboard": {
-      "get": {
-        "summary": "Retrieve the credit score leaderboard",
-        "description": "Returns the top 50 credit scores ordered descending. Public endpoint; cached for 60 seconds. Each entry contains the wallet address, its current score, and the corresponding band.\n",
-        "tags": [
-          "Score"
-        ],
-        "responses": {
-          "200": {
-            "description": "Leaderboard retrieved successfully.",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "object",
-                  "required": [
-                    "success",
-                    "leaderboard",
-                    "source"
-                  ],
-                  "properties": {
-                    "success": {
-                      "type": "boolean",
-                      "example": true
-                    },
-                    "leaderboard": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "required": [
-                          "userId",
-                          "score",
-                          "band"
-                        ],
-                        "properties": {
-                          "userId": {
-                            "type": "string",
-                            "example": "GBABCDEFGHIJK..."
-                          },
-                          "score": {
-                            "type": "integer",
-                            "example": 750
-                          },
-                          "band": {
-                            "type": "string",
-                            "enum": [
-                              "Excellent",
-                              "Good",
-                              "Fair",
-                              "Poor"
-                            ]
-                          }
-                        }
-                      }
-                    },
-                    "source": {
-                      "type": "string",
-                      "enum": [
-                        "cache",
-                        "database"
-                      ]
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal server error."
-          }
-        }
-      }
-    },
     "/score/{userId}": {
       "get": {
         "summary": "Retrieve a user's credit score",
@@ -7200,7 +7156,7 @@
             }
           },
           "401": {
-            "description": "Unauthorised — missing or invalid API key.",
+            "description": "Unauthorised (missing or invalid API key).",
             "content": {
               "application/json": {
                 "schema": {

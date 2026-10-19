@@ -13,7 +13,16 @@ const intlMiddleware = createMiddleware({
   localeCookie: { name: LOCALE_COOKIE, maxAge: LOCALE_COOKIE_MAX_AGE },
 });
 
+// Spanish and Tagalog were removed. Send old links to the English page.
+const RETIRED_LOCALE = /^\/(es|tl)(?=\/|$)/;
+
 export default function middleware(request: NextRequest) {
+  if (RETIRED_LOCALE.test(request.nextUrl.pathname)) {
+    const url = request.nextUrl.clone();
+    url.pathname = url.pathname.replace(RETIRED_LOCALE, `/${DEFAULT_LOCALE}`);
+    return NextResponse.redirect(url, 308);
+  }
+
   // 1. Run intl middleware first to get the base response and handle routing
   const response = intlMiddleware(request);
 
@@ -31,7 +40,9 @@ export default function middleware(request: NextRequest) {
     font-src 'self' https: data:;
     connect-src 'self' https: ${apiUrl};
     frame-ancestors 'self';
-  `.replace(/\s{2,}/g, " ").trim();
+  `
+    .replace(/\s{2,}/g, " ")
+    .trim();
 
   // 4. Set headers in response
   response.headers.set("Content-Security-Policy", cspHeader);
@@ -41,7 +52,7 @@ export default function middleware(request: NextRequest) {
   // Next.js uses the 'x-middleware-request-' prefix to pass headers downstream.
   response.headers.set("x-middleware-request-x-nonce", nonce);
   response.headers.set("x-middleware-request-content-security-policy", cspHeader);
-  
+
   return response;
 }
 

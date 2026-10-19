@@ -10,7 +10,7 @@ import type { Session, SimulationResult } from './types.js';
 import { assertWallet, type StellarNetwork, type WalletAdapter } from './wallet/index.js';
 
 export interface DukaPayClientOptions {
-  /** API base URL, e.g. https://api.dukapay.io */
+  /** API base URL, e.g. https://your-backend.example */
   baseUrl: string;
   /** Stellar network the API is bound to. Defaults to 'testnet'. */
   network?: StellarNetwork;
@@ -31,7 +31,7 @@ export interface DukaPayClientOptions {
  * ```ts
  * const client = new DukaPayClient({ baseUrl, wallet: new FreighterAdapter() });
  * await client.loginWithWallet();
- * const loans = await client.loans.list({ borrower: await client.address() });
+ * const { loans } = await client.loans.list({ borrower: await client.address()! });
  * ```
  */
 export class DukaPayClient {

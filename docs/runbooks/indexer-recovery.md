@@ -109,10 +109,10 @@ curl /api/admin/indexer/quarantine \
 
 Response includes:
 
-- `event_id` — original Soroban event ID
-- `ledger` — ledger sequence
-- `error` — the error message that caused quarantine
-- `raw_payload` — raw XDR base64 for debugging
+- `event_id`: original Soroban event ID
+- `ledger`: ledger sequence
+- `error`: the error message that caused quarantine
+- `raw_payload`: raw XDR base64 for debugging
 
 ### Reprocess a Quarantined Event
 
@@ -168,7 +168,7 @@ Use this after a hotfix deployment to clear the quarantine backlog.
 
 ## 6. Escalation Contacts
 
-For incidents that cannot be resolved with the steps above, escalate to the on-call platform maintainer.
+For incidents that cannot be resolved with the steps above, escalate to a maintainer.
 
 When escalating, include:
 

@@ -45,7 +45,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version-file: '.nvmrc'
 
       - name: Verify production KYC/AUDIT/AML posture
         env:
@@ -81,7 +81,7 @@ jobs:
         run: |
           echo "Checking scripts/deploy-config.json has mainnet block..."
           if ! jq -e '.mainnet' scripts/deploy-config.json > /dev/null; then
-            echo "::error::scripts/deploy-config.json missing mainnet block — add per docs/deployed-contracts.md"
+            echo "::error::scripts/deploy-config.json missing mainnet block; add per docs/deployed-contracts.md"
             exit 1
           fi
           echo "Checking mainnet network passphrase..."
@@ -164,7 +164,7 @@ jobs:
           REPO=ghcr.io/${{ env.OWNER_LC }}/dukapay-backend
           docker pull "${REPO}:production-${{ github.sha }}"
           docker run --rm "${REPO}:production-${{ github.sha }}" node --version
-          docker run --rm "${REPO}:production-${{ github.sha }}" sh -lc 'test -f /app/dist/index.js && echo "dist/index.js present"'
+          docker run --rm "${REPO}:production-${{ github.sha }}" sh -lc 'test -f /app/dist/index.js && test -f /app/dist/instrument.js && echo "dist/index.js and dist/instrument.js present"'
 
       - name: Run Trivy CRITICAL scan (production backend)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
@@ -193,7 +193,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version-file: '.nvmrc'
           cache: npm
           cache-dependency-path: scripts/package-lock.json
       - run: npm ci
@@ -203,7 +203,7 @@ jobs:
         working-directory: scripts
         env:
           STELLAR_RPC_URL: ${{ vars.STELLAR_RPC_URL }}
-      - name: Note — full mainnet verification requires real deployment
+      - name: Full mainnet verification requires real deployment
         run: |
           echo "Before mainnet contracts are deployed, verify-contracts reports SKIPPED (placeholders)."
           echo "After 'npm run deploy -- mainnet' and registry population, re-run: npm run verify:contracts -- --network mainnet"

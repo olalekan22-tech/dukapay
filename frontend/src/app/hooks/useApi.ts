@@ -54,7 +54,6 @@ export const queryKeys = {
   },
   user: {
     profile: () => ["user", "profile"] as const,
-    balance: () => ["user", "balance"] as const,
   },
   notifications: {
     all: () => ["notifications"] as const,
@@ -82,6 +81,7 @@ export const queryKeys = {
     breakdown: (userId: string) => ["scoreBreakdown", userId] as const,
   },
   borrowerLoans: {
+    all: () => ["borrowerLoans"] as const,
     byAddress: (address: string) => ["borrowerLoans", address] as const,
   },
   creditScore: {
@@ -142,7 +142,10 @@ export class ApiRequestError extends Error {
 
 // ─── CSRF (double-submit cookie) ─────────────────────────────────────────────
 
-/** Non-httpOnly cookie the backend sets so the client can echo it back. */
+/**
+ * Double-submit cookie name. The backend sets it httpOnly, so in a browser the
+ * token normally comes from the `GET /auth/csrf` response body instead.
+ */
 export const CSRF_COOKIE_NAME = "XSRF-TOKEN";
 /** Header the backend validates against that cookie. */
 export const CSRF_HEADER_NAME = "x-csrf-token";
@@ -171,11 +174,12 @@ function readCsrfCookie(): string | null {
 }
 
 /**
- * Returns the CSRF token to send on mutating requests, bootstrapping the
- * double-submit cookie from `GET /auth/csrf` the first time it is needed.
+ * Returns the CSRF token to send on mutating requests.
  *
  * With the JWT in an httpOnly cookie the browser automatically authenticates
- * mutating requests, so the backend additionally requires this token.
+ * mutating requests, so the backend additionally requires this token. The
+ * backend's CSRF cookie is httpOnly too, so the token is read from the
+ * `GET /auth/csrf` response body, which echoes the cookie's current value.
  */
 export async function getCsrfToken(): Promise<string | null> {
   const existing = readCsrfCookie();
@@ -190,11 +194,18 @@ export async function getCsrfToken(): Promise<string | null> {
   }
 
   try {
-    await fetch(`${API_URL}/auth/csrf`, {
+    const response = await fetch(`${API_URL}/api/auth/csrf`, {
       method: "GET",
       credentials: "include",
       headers: { Accept: "application/json" },
     });
+    const body = (await response.json().catch(() => null)) as {
+      data?: { csrfToken?: unknown };
+    } | null;
+    const token = body?.data?.csrfToken;
+    if (typeof token === "string" && token.length > 0) {
+      return token;
+    }
   } catch {
     return null;
   }
@@ -223,7 +234,7 @@ async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> 
     }
   }
 
-  const response = await fetch(`${API_URL}${path}`, {
+  const response = await fetch(`${API_URL}/api${path}`, {
     ...options,
     headers,
     credentials: "include",
@@ -296,12 +307,6 @@ export interface AuthSession {
   valid: boolean;
 }
 
-export interface UserBalance {
-  available: number;
-  locked: number;
-  currency: string;
-}
-
 export interface CreditScoreHistory {
   date: string;
   score: number;
@@ -366,15 +371,21 @@ export interface YieldHistory {
 export interface BorrowerLoan {
   id: number;
   principal: number;
-  accruedInterest: number;
-  totalOwed: number;
+  /** null while the loan is still being indexed */
+  accruedInterest: number | null;
+  /** null while the loan is still being indexed */
+  totalOwed: number | null;
   totalRepaid: number;
+  interestRateBps: number;
   nextPaymentDeadline: string;
-  status: LoanStatus;
+  status: LoanStatus | "pending_indexing";
   borrower: string;
-  approvedAt?: string;
+  approvedAt: string | null;
   latestEventType?: string;
 }
+
+/** The API names the id `loanId`; the app uses `id`. */
+type RawBorrowerLoan = Omit<BorrowerLoan, "id"> & { loanId: number };
 
 export interface LoanEvent {
   type: string;
@@ -383,12 +394,48 @@ export interface LoanEvent {
   txHash?: string;
 }
 
+/** Raw `GET /loans/:loanId` response: the loan sits under `summary`. */
+interface LoanDetailsResponse {
+  loanId: number;
+  summary: {
+    principal: number;
+    /** null while the loan is still being indexed */
+    accruedInterest: number | null;
+    totalRepaid: number;
+    /** null while the loan is still being indexed */
+    totalOwed: number | null;
+    /** Fraction, e.g. 0.12 for 12% */
+    interestRate: number;
+    status: LoanDetails["status"] | "pending_indexing";
+    requestedAt?: string;
+    approvedAt?: string;
+    events: { type: string; amount: string | number; timestamp: string; tx?: string }[];
+  };
+}
+
+function toLoanDetails({ loanId, summary }: LoanDetailsResponse): LoanDetails {
+  return {
+    loanId,
+    principal: summary.principal,
+    // Nothing has accrued before indexing finishes, so owed is the principal.
+    accruedInterest: summary.accruedInterest ?? 0,
+    totalRepaid: summary.totalRepaid,
+    totalOwed: summary.totalOwed ?? summary.principal,
+    interestRate: summary.interestRate * 100,
+    status: summary.status === "pending_indexing" ? "pending" : summary.status,
+    requestedAt: summary.requestedAt,
+    approvedAt: summary.approvedAt,
+    events: summary.events.map(({ tx, ...event }) => ({ ...event, txHash: tx })),
+  };
+}
+
 export interface LoanDetails {
   loanId: number;
   principal: number;
   accruedInterest: number;
   totalRepaid: number;
   totalOwed: number;
+  /** Percent, e.g. 12 for 12% */
   interestRate: number;
   status: "active" | "repaid" | "defaulted" | "pending" | "liquidated";
   requestedAt?: string;
@@ -639,7 +686,7 @@ interface CursorListParams extends Record<string, unknown> {
 
 interface BorrowerLoansPageResponse {
   success?: boolean;
-  data: { borrower: string; loans: BorrowerLoan[] };
+  data: { borrower: string; loans: RawBorrowerLoan[] };
   page_info?: RawPageInfo;
   total_count?: number | null;
 }
@@ -749,7 +796,7 @@ async function fetchBorrowerLoansPage(
   );
 
   return {
-    items: response.data?.loans ?? [],
+    items: (response.data?.loans ?? []).map(({ loanId, ...loan }) => ({ ...loan, id: loanId })),
     pageInfo: normalizePageInfo(response.page_info, response.total_count),
   };
 }
@@ -798,20 +845,7 @@ export function useLoan(
 ) {
   return useQuery<LoanDetails>({
     queryKey: queryKeys.loans.detail(id ?? ""),
-    queryFn: async () => {
-      const response = await apiFetch<LoanDetails | { success: boolean; data: LoanDetails }>(
-        `/loans/${id}`,
-      );
-      if (
-        typeof response === "object" &&
-        response !== null &&
-        "success" in response &&
-        "data" in response
-      ) {
-        return response.data;
-      }
-      return response;
-    },
+    queryFn: async () => toLoanDetails(await apiFetch<LoanDetailsResponse>(`/loans/${id}`)),
     enabled: !!id,
     ...options,
   });
@@ -923,16 +957,17 @@ export function useLoanEvents(
         ledger_closed_at: string;
         tx_hash?: string;
       }
+      // Shape of GET /loans/:loanId/events (indexerController.getLoanEvents).
       interface LoanEventsResponse {
         success: boolean;
         data: {
           loanId: number;
-          events: RawEvent[];
+          items: RawEvent[];
         };
       }
       const response = await apiFetch<LoanEventsResponse>(`/loans/${loanId}/events`);
-      if (response?.success && response.data?.events) {
-        return response.data.events.map((e) => ({
+      if (response?.success && response.data?.items) {
+        return response.data.items.map((e) => ({
           type: e.event_type,
           amount: e.amount,
           timestamp: e.ledger_closed_at,
@@ -1143,33 +1178,34 @@ export function useUpdateUserProfile() {
   });
 }
 
-/**
- * Fetches the current user's wallet balance.
- */
-export function useUserBalance(
-  options?: Omit<UseQueryOptions<UserBalance>, "queryKey" | "queryFn">,
-) {
-  return useQuery<UserBalance>({
-    queryKey: queryKeys.user.balance(),
-    queryFn: () => apiFetch<UserBalance>("/user/balance"),
-    ...options,
-  });
-}
-
 // ─── Chart data hooks ─────────────────────────────────────────────────────────
 
 /**
  * Fetches credit score history for trend visualization.
  * Returns historical score data points over time.
  */
+/**
+ * On-chain score history for a wallet (GET /score/:walletAddress/history).
+ * The contract records the ledger of each change, not a time, so `date` holds
+ * the ledger sequence as a label.
+ */
 export function useCreditScoreHistory(
-  userId: string | undefined,
+  walletAddress: string | undefined,
   options?: Omit<UseQueryOptions<CreditScoreHistory[]>, "queryKey" | "queryFn">,
 ) {
   return useQuery<CreditScoreHistory[]>({
-    queryKey: queryKeys.creditScoreHistory.byUser(userId ?? ""),
-    queryFn: () => apiFetch<CreditScoreHistory[]>(`/score/${userId}/history`),
-    enabled: !!userId,
+    queryKey: queryKeys.creditScoreHistory.byUser(walletAddress ?? ""),
+    queryFn: async () => {
+      const response = await apiFetch<{
+        history?: Array<{ score: number; timestamp: number; reason: string }>;
+      }>(`/score/${walletAddress}/history`);
+      return (response.history ?? []).map((entry) => ({
+        date: String(entry.timestamp),
+        score: entry.score,
+        event: entry.reason,
+      }));
+    },
+    enabled: !!walletAddress,
     ...options,
   });
 }
@@ -1425,7 +1461,7 @@ export function useBorrowerLoans(borrowerAddress: string | undefined) {
 
   const stats: LoanStats = {
     totalActive: activeLoans.length,
-    totalOwed: activeLoans.reduce((sum, l) => sum + l.totalOwed, 0),
+    totalOwed: activeLoans.reduce((sum, l) => sum + (l.totalOwed ?? l.principal), 0),
     nextPaymentDue: upcomingDeadlines[0]?.nextPaymentDeadline ?? null,
     overdueCount: overdueLoans.length,
   };
@@ -1696,107 +1732,12 @@ export function useResolveAdminDispute() {
 // ─── Optimistic mutations ─────────────────────────────────────────────────────
 
 /**
- * Submits a loan repayment directly to the server and updates the cache
- * with optimistic rollback on failure.
- *
- * This hook calls `/loans/{loanId}/repay` (a full server-side build+sign+submit
- * flow). It is NOT a build-only hook — the mutation succeeds only when the
- * server has submitted the transaction on-chain and returned a `txHash`.
- * The optimistic loan-status update is rolled back automatically on error.
- */
-export function useRepayLoan() {
-  const queryClient = useQueryClient();
-
-  type RepayContext = {
-    previousLoanDetail: unknown;
-    previousBorrowerLoans: unknown;
-    previousPoolStats: unknown;
-  };
-
-  return useMutation<
-    { txHash: string },
-    Error,
-    { loanId: number; amount: number; borrowerAddress: string },
-    RepayContext
-  >({
-    mutationFn: ({ loanId, amount }) =>
-      apiFetch<{ txHash: string }>(`/loans/${loanId}/repay`, {
-        method: "POST",
-        body: JSON.stringify({ amount }),
-      }),
-
-    onMutate: async ({ loanId, amount, borrowerAddress }) => {
-      await queryClient.cancelQueries({
-        queryKey: queryKeys.loans.detail(String(loanId)),
-      });
-      await queryClient.cancelQueries({
-        queryKey: queryKeys.borrowerLoans.byAddress(borrowerAddress),
-      });
-      await queryClient.cancelQueries({ queryKey: queryKeys.pool.stats() });
-
-      const previousLoanDetail = queryClient.getQueryData(queryKeys.loans.detail(String(loanId)));
-      const previousBorrowerLoans = queryClient.getQueryData(
-        queryKeys.borrowerLoans.byAddress(borrowerAddress),
-      );
-      const previousPoolStats = queryClient.getQueryData(queryKeys.pool.stats());
-
-      // Optimistically update the loan detail
-      queryClient.setQueryData(
-        queryKeys.loans.detail(String(loanId)),
-        (old: LoanDetails | undefined) => {
-          if (!old) return old;
-          const newOwed = Math.max(0, old.totalOwed - amount);
-          return {
-            ...old,
-            totalOwed: newOwed,
-            totalRepaid: old.totalRepaid + amount,
-            status: newOwed <= 0 ? ("repaid" as const) : old.status,
-          };
-        },
-      );
-
-      return { previousLoanDetail, previousBorrowerLoans, previousPoolStats };
-    },
-
-    onError: (_error, { loanId, borrowerAddress }, context) => {
-      if (context?.previousLoanDetail !== undefined) {
-        queryClient.setQueryData(
-          queryKeys.loans.detail(String(loanId)),
-          context.previousLoanDetail,
-        );
-      }
-      if (context?.previousBorrowerLoans !== undefined) {
-        queryClient.setQueryData(
-          queryKeys.borrowerLoans.byAddress(borrowerAddress),
-          context.previousBorrowerLoans,
-        );
-      }
-      if (context?.previousPoolStats !== undefined) {
-        queryClient.setQueryData(queryKeys.pool.stats(), context.previousPoolStats);
-      }
-    },
-
-    onSettled: (_data, _error, { loanId, borrowerAddress }) => {
-      queryClient.invalidateQueries({ queryKey: queryKeys.loans.detail(String(loanId)) });
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.borrowerLoans.byAddress(borrowerAddress),
-      });
-      // Also invalidate paginated borrower loans (borrowerPage) so both namespaces stay in sync (#1219)
-      queryClient.invalidateQueries({
-        queryKey: queryKeys.loans.borrowerPagePrefix(borrowerAddress),
-      });
-      queryClient.invalidateQueries({ queryKey: queryKeys.pool.stats() });
-    },
-  });
-}
-
-/**
- * Builds an unsigned deposit transaction XDR. Does NOT deposit — it only calls
+ * Builds an unsigned deposit transaction XDR. Does NOT deposit; it only calls
  * `/pool/build-deposit` and returns `{ unsignedTxXdr, networkPassphrase }`.
  *
  * Callers must pair this with `signTransaction` + `submitPoolTransaction` to
  * complete the deposit (see `useDepositOperation` in useRepaymentOperation.ts).
- * The optimistic UI update fires on build success, not on-chain confirmation —
+ * The optimistic UI update fires on build success, not on-chain confirmation;
  * treat it as a UX hint only and always confirm via `onSettled` refetch.
  */
 export function useDepositToPool() {
@@ -1865,12 +1806,12 @@ export function useDepositToPool() {
 }
 
 /**
- * Builds an unsigned withdrawal transaction XDR. Does NOT withdraw — it only calls
+ * Builds an unsigned withdrawal transaction XDR. Does NOT withdraw; it only calls
  * `/pool/build-withdraw` and returns `{ unsignedTxXdr, networkPassphrase }`.
  *
  * Callers must pair this with `signTransaction` + `submitPoolTransaction` to
  * complete the withdrawal (see `useWithdrawalOperation` in useRepaymentOperation.ts).
- * The optimistic UI update fires on build success, not on-chain confirmation —
+ * The optimistic UI update fires on build success, not on-chain confirmation;
  * treat it as a UX hint only and always confirm via `onSettled` refetch.
  */
 export function useWithdrawFromPool() {
@@ -1951,6 +1892,38 @@ export async function submitPoolTransaction(signedTxXdr: string) {
 /**
  * Submits a signed loan transaction (e.g. repayment) to the Stellar network.
  */
+/**
+ * Builds an unsigned `repay(borrower, loan_id, amount)` transaction on the
+ * backend (POST /loans/:loanId/repay), which checks loan ownership. Sign it in
+ * the wallet, then send it with `submitLoanTransaction`.
+ */
+export async function buildRepaymentTx(
+  loanId: string | number,
+  amount: number,
+  borrowerPublicKey: string,
+) {
+  return apiFetch<{ unsignedTxXdr: string; networkPassphrase?: string }>(`/loans/${loanId}/repay`, {
+    method: "POST",
+    body: JSON.stringify({ amount, borrowerPublicKey }),
+  });
+}
+
+/**
+ * Builds an unsigned `request_loan(borrower, amount, term)` transaction on the
+ * backend (POST /loans/request). Sign it in the wallet, then send it with
+ * `submitLoanTransaction`.
+ */
+export async function buildLoanRequestTx(
+  amount: number,
+  borrowerPublicKey: string,
+  termLedgers: number,
+) {
+  return apiFetch<{ unsignedTxXdr: string; networkPassphrase?: string }>("/loans/request", {
+    method: "POST",
+    body: JSON.stringify({ amount, borrowerPublicKey, termLedgers }),
+  });
+}
+
 export async function submitLoanTransaction(signedTxXdr: string) {
   return apiFetch<{ txHash: string; status: string; resultXdr?: string }>("/loans/submit", {
     method: "POST",

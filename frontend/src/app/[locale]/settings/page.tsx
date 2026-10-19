@@ -8,6 +8,7 @@ import { Button } from "../../components/ui/Button";
 import { ConnectWalletButton } from "../../components/ui/ConnectWalletButton";
 import { Input } from "../../components/ui/Input";
 import { useLogout } from "../../hooks/useLogout";
+import { useWallet } from "../../components/providers/WalletProvider";
 import { GamificationSettings } from "../../components/gamification/GamificationSettings";
 import { useThemeStore } from "../../stores/useThemeStore";
 import {
@@ -22,8 +23,6 @@ import {
   useUpdateUserProfile,
 } from "../../hooks/useApi";
 import { COPY_FEEDBACK_RESET_MS } from "../../components/ui";
-import { useLocaleSwitcher } from "../../hooks/useLocaleSwitcher";
-import { LOCALES, LOCALE_LABELS } from "../../lib/locales";
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 interface NotificationPrefs {
@@ -213,7 +212,8 @@ function WalletSection() {
   const t = useTranslations("Settings.wallet");
   const address = useWalletStore(selectWalletAddress);
   const network = useWalletStore(selectWalletNetwork);
-  const disconnect = useWalletStore((s) => s.disconnect);
+  // Same full cleanup as the header button (service workers, caches, wallet storage).
+  const { disconnectWallet } = useWallet();
   const { logout } = useLogout();
 
   return (
@@ -261,7 +261,7 @@ function WalletSection() {
             <div className="pt-2 border-t border-zinc-200 dark:border-zinc-800 flex flex-col gap-2 sm:flex-row">
               <Button
                 variant="outline"
-                onClick={() => disconnect()}
+                onClick={() => disconnectWallet()}
                 leftIcon={<LogOut className="h-4 w-4" />}
                 className="text-amber-600 border-amber-200 hover:bg-amber-50 dark:text-amber-400 dark:border-amber-900/50 dark:hover:bg-amber-950/20"
               >
@@ -540,7 +540,6 @@ function SecuritySection() {
 
 function DisplaySection() {
   const t = useTranslations("Settings");
-  const { locale, switchLocale, isPending } = useLocaleSwitcher();
 
   const theme = useThemeStore((s) => s.theme);
   const hydrated = useThemeStore((s) => s.hydrated);
@@ -586,31 +585,6 @@ function DisplaySection() {
               );
             })}
           </div>
-        </div>
-
-        <div>
-          <label
-            htmlFor="settings-language"
-            className="text-sm font-medium text-zinc-900 dark:text-zinc-100 block mb-2"
-          >
-            {t("language")}
-          </label>
-          <select
-            id="settings-language"
-            value={locale}
-            disabled={isPending}
-            onChange={(e) => switchLocale(e.target.value)}
-            className="w-full rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm text-zinc-900 focus:border-indigo-500 focus:outline-none dark:border-zinc-800 dark:bg-zinc-900 dark:text-zinc-50"
-          >
-            {LOCALES.map((code) => (
-              <option key={code} value={code} lang={code}>
-                {LOCALE_LABELS[code]}
-              </option>
-            ))}
-          </select>
-          <p className="text-xs text-zinc-400 dark:text-zinc-500 mt-1.5">
-            {t("display.languageHelper")}
-          </p>
         </div>
       </CardContent>
     </Card>
@@ -669,7 +643,7 @@ export default function SettingsPage() {
   };
 
   return (
-    <main className="space-y-8 min-h-screen p-8 lg:p-12 max-w-5xl mx-auto">
+    <div className="space-y-8 min-h-screen p-8 lg:p-12 max-w-5xl mx-auto">
       <header className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <p className="text-sm font-semibold uppercase tracking-widest text-indigo-600">
@@ -736,6 +710,6 @@ export default function SettingsPage() {
           {renderSection()}
         </div>
       </div>
-    </main>
+    </div>
   );
 }

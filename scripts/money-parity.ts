@@ -1,9 +1,9 @@
 /**
  * Cross-language money-policy parity runner (issue #432).
  *
- * The stroop-integer money kernel exists twice on purpose — once in Rust
+ * The stroop-integer money kernel exists twice on purpose: once in Rust
  * (`contracts/money/src/lib.rs`, the on-chain implementation) and once in
- * TypeScript (`backend/src/money/decimal.ts`, the off-chain settlement path) —
+ * TypeScript (`backend/src/money/decimal.ts`, the off-chain settlement path),
  * and `money-policy.json` is the single source of truth for the constants they
  * share. Nothing until now actually executed both implementations over the same
  * inputs: `cargo test -p money` and the backend jest suite each only pin their
@@ -29,9 +29,6 @@
  *   npx tsx scripts/money-parity.ts --randomized 5000 --seed 0x432432
  *
  * Caveats, stated rather than hidden:
- *   - `backend/src/money/calculations.ts` is float/`Math.round`-based and does
- *     not share the kernel, so it is deliberately not compared here; doing so
- *     would compare two different formulas, not two implementations of one.
  *   - `decimal.ts` uses unbounded `bigint` while the contract's intermediates are
  *     checked `i128`, and `split_pro_rata`'s contract entry point does not reject
  *     a negative total that `decimal.ts` does. Randomized `round_div`/`split_pro_rata`
@@ -330,7 +327,7 @@ function runRust(cases: readonly string[]): string[] {
   const lines = stdout.split('\n').filter((line) => line.length > 0);
   if (lines.length !== cases.length) {
     throw new Error(
-      `money-parity: cargo printed ${lines.length} result lines for ${cases.length} cases — expected exactly one line per case:\n${stdout}`,
+      `money-parity: cargo printed ${lines.length} result lines for ${cases.length} cases; expected exactly one line per case:\n${stdout}`,
     );
   }
   return lines;
@@ -458,7 +455,7 @@ function main(): void {
   }
 
   if (problems.length > 0) {
-    console.error(`money-parity: FAILED — ${problems.length} divergence(s)`);
+    console.error(`money-parity: FAILED with ${problems.length} divergence(s)`);
     for (const problem of problems.slice(0, 25)) {
       console.error(`  ${problem}`);
     }
@@ -469,7 +466,7 @@ function main(): void {
   }
 
   console.log(
-    `money-parity: OK — ${inputs.length} shared vectors agreed with contracts/money and decimal.ts, ` +
+    `money-parity: OK, ${inputs.length} shared vectors agreed with contracts/money and decimal.ts, ` +
       `${crossChecked} randomized cases cross-checked (seed=0x${seed.toString(16)})`,
   );
 }

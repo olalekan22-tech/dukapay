@@ -23,7 +23,7 @@ function createWrapper() {
 }
 
 function clearCsrfCookie() {
-  // Assigning "" is a no-op in jsdom (as in real browsers) — deleting a
+  // Assigning "" is a no-op in jsdom (as in real browsers); deleting a
   // cookie requires expiring it explicitly, otherwise it leaks into
   // subsequent tests.
   document.cookie = `${CSRF_COOKIE_NAME}=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/`;
@@ -65,6 +65,24 @@ describe("CSRF token mechanism", () => {
 
     const token = await getCsrfToken();
     expect(token).toBe(testToken);
+  });
+
+  it("reads the token from the /auth/csrf response when the cookie is httpOnly", async () => {
+    // The backend sets XSRF-TOKEN httpOnly, so document.cookie never shows it.
+    const fetchMock = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ success: true, data: { csrfToken: testToken } }),
+    });
+    global.fetch = fetchMock as unknown as typeof fetch;
+
+    const token = await getCsrfToken();
+
+    expect(token).toBe(testToken);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/api/auth/csrf"),
+      expect.objectContaining({ credentials: "include" }),
+    );
   });
 
   it("returns null for CSRF token in SSR context", async () => {

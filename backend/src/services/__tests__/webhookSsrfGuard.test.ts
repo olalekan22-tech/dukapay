@@ -1,5 +1,5 @@
 /**
- * Regression tests for issue #641 — SSRF guard at dispatch time.
+ * Regression tests for issue #641: SSRF guard at dispatch time.
  *
  * Verifies that postWebhook (called from sendToWebhook / retryWebhookDelivery)
  * re-validates the resolved IP on every dispatch, not just the hostname at
@@ -11,7 +11,9 @@
 import { jest, describe, it, expect, beforeEach } from '@jest/globals';
 
 // ---- mock db/connection so webhookService can be imported ----
-const mockQuery = jest.fn<() => Promise<{ rows: unknown[]; rowCount?: number }>>().mockResolvedValue({ rows: [] });
+const mockQuery = jest
+  .fn<() => Promise<{ rows: unknown[]; rowCount?: number }>>()
+  .mockResolvedValue({ rows: [] });
 
 jest.unstable_mockModule('../../db/connection.js', () => ({
   default: { query: mockQuery },
@@ -47,7 +49,7 @@ jest.unstable_mockModule('node:dns/promises', () => ({
 const mockFetch = jest.fn<() => Promise<Response>>();
 global.fetch = mockFetch as unknown as typeof fetch;
 
-const { WebhookService } = await import('../webhookService.js');
+const { WebhookService, isPrivateHost } = await import('../webhookService.js');
 
 const SAFE_EVENT = {
   eventId: 'evt-test-001',
@@ -130,19 +132,91 @@ describe('dispatch-time IP validation (DNS-rebinding SSRF guard)', () => {
   it('retryWebhookDelivery blocks when callback URL now resolves to private IP', async () => {
     mockResolve4.mockResolvedValue(['172.16.0.1']);
 
-    await expect(
-      WebhookService.retryWebhookDelivery(
-        10,
-        1,
-        'https://rebind.example.com/hook',
-        undefined,
-        'evt-retry-001',
-        'LoanApproved',
-        { eventId: 'evt-retry-001', eventType: 'LoanApproved' },
-        1,
-      ),
-    ).rejects.toThrow(/disallowed address/i);
+    // Retry records failures on the delivery row instead of throwing, so one
+    // blocked delivery can't abort the rest of the processRetries batch.
+    await WebhookService.retryWebhookDelivery(
+      10,
+      1,
+      'https://rebind.example.com/hook',
+      undefined,
+      'evt-retry-001',
+      'LoanApproved',
+      { eventId: 'evt-retry-001', eventType: 'LoanApproved' },
+      1,
+    );
 
     expect(mockFetch).not.toHaveBeenCalled();
+    const [sql, params] = mockQuery.mock.calls[0] as unknown as [string, unknown[]];
+    expect(sql).toContain('UPDATE webhook_deliveries');
+    expect(params[1]).toMatch(/disallowed address/i); // last_error
+    expect(params[2]).toBeNull(); // next_retry_at: no retry for a blocked URL
   });
+
+  it.each([
+    'http://[::ffff:127.0.0.1]/hook',
+    'http://0.0.0.0/hook',
+    'http://[fd00::1]/hook',
+    'http://100.64.0.1/hook',
+    'http://[::]/hook',
+  ])('blocks dispatch to %s', async (callbackUrl) => {
+    mockQuery.mockResolvedValueOnce({ rows: [{ id: 6, callback_url: callbackUrl, secret: null }] });
+
+    const svc = new WebhookService();
+    await svc.dispatch(SAFE_EVENT);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('blocks dispatch when hostname resolves to an IPv4-mapped loopback over AAAA', async () => {
+    mockResolve4.mockResolvedValue([]);
+    mockResolve6.mockResolvedValue(['::ffff:127.0.0.1']);
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ id: 7, callback_url: 'https://mapped.example.com/hook', secret: null }],
+    });
+
+    const svc = new WebhookService();
+    await svc.dispatch(SAFE_EVENT);
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('does not follow redirects', async () => {
+    mockResolve4.mockResolvedValue(['203.0.113.42']);
+    mockFetch.mockResolvedValue({ ok: false, status: 302 } as Response);
+    mockQuery
+      .mockResolvedValueOnce({
+        rows: [{ id: 8, callback_url: 'https://redirector.example.com/hook', secret: null }],
+      })
+      .mockResolvedValue({ rows: [], rowCount: 1 });
+
+    const svc = new WebhookService();
+    await svc.dispatch(SAFE_EVENT);
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://redirector.example.com/hook',
+      expect.objectContaining({ redirect: 'manual' }),
+    );
+  });
+});
+
+describe('registration-time host check (isPrivateHost)', () => {
+  it.each([
+    'localhost',
+    'api.localhost',
+    'db',
+    'metadata.google.internal',
+    '127.0.0.1',
+    '[::ffff:7f00:1]',
+    '0.0.0.0',
+    '[fd00::1]',
+    '[fe80::1]',
+    '100.64.0.1',
+    '172.16.5.4',
+  ])('rejects %s', (host) => {
+    expect(isPrivateHost(host)).toBe(true);
+  });
+
+  it.each(['hooks.example.com', '203.0.113.42', '[2001:db8::1]', '172.32.0.1'])(
+    'allows %s',
+    (host) => {
+      expect(isPrivateHost(host)).toBe(false);
+    },
+  );
 });

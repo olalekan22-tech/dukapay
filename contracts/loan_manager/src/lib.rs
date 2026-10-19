@@ -35,6 +35,9 @@ pub trait LendingPoolInterface {
     fn is_paused(env: Env) -> bool;
     fn pool_balance(env: Env, token: Address) -> i128;
     fn get_total_outstanding(env: Env, token: Address) -> i128;
+    fn record_loan_yield(env: Env, token: Address, amount: i128);
+    fn record_loan_loss(env: Env, token: Address, amount: i128);
+    fn disburse(env: Env, to: Address, token: Address, amount: i128);
 }
 
 mod events;
@@ -175,7 +178,8 @@ impl LoanManager {
     const CURRENT_VERSION: u32 = 4;
     const DEFAULT_LATE_FEE_RATE_BPS: u32 = 500;
     const MAX_LATE_FEE_CAP_BPS: u32 = 2500;
-    const DEFAULT_MAX_LOAN_AMOUNT: i128 = 50_000;
+    /// 50,000 USDC. Amounts are in stroops (money::STROOP_SCALE per token unit).
+    const DEFAULT_MAX_LOAN_AMOUNT: i128 = 50_000 * money::STROOP_SCALE;
     const DEFAULT_MAX_LOANS_PER_BORROWER: u32 = 3;
     const DEFAULT_GRACE_PERIOD_LEDGERS: u32 = 4_320;
     const DEFAULT_DEFAULT_WINDOW_LEDGERS: u32 = Self::DEFAULT_TERM_LEDGERS;
@@ -187,7 +191,11 @@ impl LoanManager {
     const LATE_REPAYMENT_SCORE_PENALTY: i32 = 10;
     const DEFAULT_SCORE_PENALTY_POINTS: u32 = 50;
     const NFT_MAX_SCORE: u32 = 850;
+    /// In stroops. Also the dust threshold: a remaining debt at or below this is
+    /// closed by any payment (see repay), so it must stay tiny. Not scaled to USDC.
     const DEFAULT_MIN_REPAYMENT_AMOUNT: i128 = 100;
+    /// Repayment, in stroops, that earns one credit-score point: 100 USDC.
+    const STROOPS_PER_SCORE_POINT: i128 = 100 * money::STROOP_SCALE;
     const MAX_EXTENSIONS: u32 = 3;
     const EXTENSION_FEE_BPS: u32 = 100; // 1% of remaining principal
     /// Default minimum interest rate (configurable via set_rate_bounds). #631
@@ -243,6 +251,22 @@ impl LoanManager {
             .instance()
             .get(&DataKey::LendingPool)
             .expect("not initialized")
+    }
+
+    /// Reconcile the pool's book value when a loan receivable is settled.
+    /// Cash recovered up to remaining principal replaces the loan asset; any
+    /// excess is realized interest/fees, while a shortfall is a principal loss.
+    fn record_pool_recovery(env: &Env, token: &Address, principal: i128, recovered: i128) {
+        let pool = PoolClient::new(env, &Self::lending_pool(env));
+        match recovered.cmp(&principal) {
+            core::cmp::Ordering::Greater => {
+                pool.record_loan_yield(token, &(recovered - principal));
+            }
+            core::cmp::Ordering::Less => {
+                pool.record_loan_loss(token, &(principal - recovered));
+            }
+            core::cmp::Ordering::Equal => {}
+        }
     }
 
     fn loan_counter(env: &Env) -> u32 {
@@ -1271,8 +1295,6 @@ impl LoanManager {
     /// not pending; and [`LoanError::InsufficientPoolLiquidity`] when available
     /// pool liquidity is below the loan amount.
     pub fn approve_loan(env: Env, loan_id: u32) -> Result<(), LoanError> {
-        use soroban_sdk::token::TokenClient;
-
         // ── CHECKS ──────────────────────────────────────────────────────────
         let admin = Self::admin(&env);
         admin.require_auth();
@@ -1303,7 +1325,7 @@ impl LoanManager {
             .expect("token not set");
         let term_ledgers = Self::read_default_term(&env);
 
-        // Cross-contract READ for liquidity check — still in the CHECKS phase.
+        // Cross-contract READ for liquidity check, still in the CHECKS phase.
         let pool_client = PoolClient::new(&env, &lending_pool);
         let pool_balance = pool_client.pool_balance(&token);
         let total_outstanding = Self::total_outstanding(&env, &token);
@@ -1335,8 +1357,8 @@ impl LoanManager {
         Self::bump_persistent_ttl(&env, &loan_key);
 
         // ── INTERACTIONS (external calls last) ──────────────────────────────
-        let token_client = TokenClient::new(&env, &token);
-        token_client.transfer(&lending_pool, &borrower, &transfer_amount);
+        let pool_client = PoolClient::new(&env, &lending_pool);
+        pool_client.disburse(&borrower, &token, &transfer_amount);
 
         events::loan_approved(
             &env,
@@ -1444,6 +1466,7 @@ impl LoanManager {
             .get(&DataKey::LendingPool)
             .expect("lending pool not set");
 
+        let principal_due_before_payment = Self::remaining_principal(&loan);
         let (principal_payment, interest_payment, late_fee_payment) =
             Self::proportional_repayment_split(&loan, amount);
 
@@ -1509,6 +1532,18 @@ impl LoanManager {
         // ── INTERACTIONS: external calls after state is durable (#630) ───────────
         let token_client = TokenClient::new(&env, &token);
         token_client.transfer(&borrower, &lending_pool, &amount);
+        let realized_income = interest_payment
+            .checked_add(late_fee_payment)
+            .expect("repayment income overflow");
+        PoolClient::new(&env, &lending_pool).record_loan_yield(&token, &realized_income);
+        if is_rounding_dust_forgiveness && amount < total_debt {
+            Self::record_pool_recovery(
+                &env,
+                &token,
+                principal_due_before_payment,
+                principal_payment,
+            );
+        }
 
         if completed {
             // release_collateral_internal reads collateral from storage and performs
@@ -1518,7 +1553,7 @@ impl LoanManager {
             events::loan_repaid(&env, borrower.clone(), loan_id, amount);
         }
 
-        if amount >= 100 {
+        if amount >= Self::STROOPS_PER_SCORE_POINT {
             let nft_contract = Self::nft_contract(&env);
             let nft_client = NftClient::new(&env, &nft_contract);
             let borrower_score = nft_client.get_score(&borrower);
@@ -1533,8 +1568,8 @@ impl LoanManager {
                 } else {
                     // Use apply_score_delta rather than update_score so score adjustments
                     // work for any token denomination without hitting RemittanceNFT's
-                    // anti-dust repayment floor (which assumes XLM stroops).
-                    let points_i128 = amount / 100;
+                    // anti-dust repayment floor. 1 point per 100 USDC repaid.
+                    let points_i128 = amount / Self::STROOPS_PER_SCORE_POINT;
                     let points_i32 = if points_i128 > i32::MAX as i128 {
                         i32::MAX
                     } else if points_i128 <= 0 {
@@ -1789,6 +1824,7 @@ impl LoanManager {
             (collateral_amount, 0, 0)
         };
 
+        let principal_outstanding = Self::remaining_principal(&loan);
         Self::apply_debt_recovery(&mut loan, debt_repaid);
         loan.status = LoanStatus::Liquidated;
         loan.collateral_amount = 0;
@@ -1813,6 +1849,7 @@ impl LoanManager {
         if debt_repaid > 0 {
             token_client.transfer(&env.current_contract_address(), &lending_pool, &debt_repaid);
         }
+        Self::record_pool_recovery(&env, &token, principal_outstanding, debt_repaid);
         if liquidator_bonus > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
@@ -2117,7 +2154,8 @@ impl LoanManager {
                 if available_liquidity < additional {
                     return Err(LoanError::InsufficientPoolLiquidity);
                 }
-                token_client.transfer(&lending_pool, &loan.borrower, &additional);
+                let pool_client = PoolClient::new(&env, &lending_pool);
+                pool_client.disburse(&loan.borrower, &token, &additional);
             }
             core::cmp::Ordering::Less => {
                 // Borrower returns the excess principal to the pool.
@@ -2152,7 +2190,7 @@ impl LoanManager {
             core::cmp::Ordering::Equal => {}
         }
 
-        // #1354: delta must be new minus prior, not prior minus new — adjust_total_outstanding
+        // #1354: delta must be new minus prior, not prior minus new: adjust_total_outstanding
         // adds the delta to the running total, so borrowing more must produce a positive delta.
         let outstanding_delta = new_amount
             .checked_sub(loan.amount)
@@ -2391,7 +2429,7 @@ impl LoanManager {
     }
 
     /// Set a new admin address. Only callable by the multisig governance contract.
-    /// This is the exclusive admin transfer path — direct propose/accept is not supported.
+    /// This is the exclusive admin transfer path; direct propose/accept is not supported.
     pub fn set_admin(env: Env, new_admin: Address) {
         let current_admin = Self::admin(&env);
         // Only the governance contract can call this function
@@ -2753,6 +2791,8 @@ impl LoanManager {
             return Err(LoanError::LoanNotPastDue);
         }
 
+        let principal_outstanding = Self::remaining_principal(&loan);
+        let collateral_recovered = loan.collateral_amount;
         loan.status = LoanStatus::Defaulted;
         let token: Address = env
             .storage()
@@ -2764,6 +2804,7 @@ impl LoanManager {
         Self::bump_persistent_ttl(&env, &loan_key);
         Self::decrement_borrower_loan_count(&env, &loan.borrower);
         Self::seize_collateral_internal(&env, loan_id);
+        Self::record_pool_recovery(&env, &token, principal_outstanding, collateral_recovered);
 
         let nft_contract = Self::nft_contract(&env);
         let nft_client = NftClient::new(&env, &nft_contract);
@@ -2852,6 +2893,7 @@ impl LoanManager {
                 .expect("lending pool not set");
             let token_client = TokenClient::new(&env, &token);
             token_client.transfer(&borrower, &lending_pool, &extension_fee);
+            PoolClient::new(&env, &lending_pool).record_loan_yield(&token, &extension_fee);
         }
 
         // Extend the due date
@@ -2910,6 +2952,8 @@ impl LoanManager {
                 continue;
             }
 
+            let principal_outstanding = Self::remaining_principal(&loan);
+            let collateral_recovered = loan.collateral_amount;
             loan.status = LoanStatus::Defaulted;
             let token: Address = env
                 .storage()
@@ -2921,6 +2965,7 @@ impl LoanManager {
             Self::bump_persistent_ttl(&env, &loan_key);
             Self::decrement_borrower_loan_count(&env, &loan.borrower);
             Self::seize_collateral_internal(&env, loan_id);
+            Self::record_pool_recovery(&env, &token, principal_outstanding, collateral_recovered);
 
             let nft_contract = Self::nft_contract(&env);
             let nft_client = NftClient::new(&env, &nft_contract);

@@ -7,6 +7,11 @@ use soroban_sdk::{
     contract, contractimpl, testutils::Address as _, Address, BytesN, Env, FromVal, String,
 };
 
+/// Test amounts written in USDC, converted to stroops (the unit the contracts use).
+fn usdc(amount: i128) -> i128 {
+    amount * money::STROOP_SCALE
+}
+
 fn create_test_commitment(env: &Env, value: u8) -> BytesN<32> {
     let mut commitment_bytes = [0u8; 32];
     commitment_bytes[0] = value;
@@ -56,9 +61,11 @@ fn setup_test<'a>(
     // 4. Deploy the LoanManager contract
     let loan_manager_id = env.register(LoanManager, ());
     let loan_manager_client = LoanManagerClient::new(env, &loan_manager_id);
+    pool_client.set_loan_manager(&loan_manager_id);
 
-    // Authorize LoanManager on NFT contract before initialization
+    // Authorize LoanManager on NFT and pool contract before initialization
     nft_client.authorize_minter(&loan_manager_id);
+    pool_client.set_loan_manager(&loan_manager_id);
 
     // 5. Initialize the Loan Manager with the NFT contract, lending pool, token, admin, and governance
     let governance = Address::generate(env);
@@ -86,10 +93,18 @@ fn create_upgrade_hash(env: &Env) -> BytesN<32> {
     BytesN::from_array(env, &[9u8; 32])
 }
 
+fn seed_pool(env: &Env, pool_id: &Address, token_id: &Address, amount: i128) {
+    let pool = LendingPoolClient::new(env, pool_id);
+    let provider = Address::generate(env);
+    StellarAssetClient::new(env, token_id).mint(&provider, &amount);
+    pool.deposit(&provider, token_id, &amount, &0);
+}
+
 #[test]
 #[should_panic]
 fn test_upgrade_requires_admin_auth() {
     let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
     let (manager, _nft_client, _pool, _token, _token_admin) = setup_test(&env);
 
     env.mock_auths(&[]);
@@ -183,8 +198,9 @@ fn test_migration_guard_prevents_double_execution() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    let pool = LendingPoolClient::new(&env, &pool_client);
     stellar_token.mint(&borrower, &10_000);
+    pool.deposit(&borrower, &token_id, &10_000, &0);
 
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
     manager.approve_loan(&loan_id);
@@ -288,8 +304,7 @@ fn test_approve_loan_flow() {
 
     // 2. Setup liquidity - mint tokens to the pool address
     let token_client = TokenClient::new(&env, &token_id);
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10000);
+    seed_pool(&env, &pool_client, &token_id, 10000);
 
     // 3. Request a loan
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
@@ -363,8 +378,7 @@ fn test_approve_loan_accounts_for_outstanding_approved_loans() {
         &None,
     );
 
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     let first_loan = manager.request_loan(&borrower_one, &6_000, &17280);
     let second_loan = manager.request_loan(&borrower_two, &6_000, &17280);
@@ -447,7 +461,7 @@ fn test_paused_blocks_new_loans_and_repayments_but_allows_collateral_release() {
 
     // Seed liquidity so approve_loan can proceed prior to pause.
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &50_000);
+    seed_pool(&env, &pool_client, &token_id, 50_000);
 
     // Fund borrower so they can repay.
     let token_client = TokenClient::new(&env, &token_id);
@@ -674,8 +688,7 @@ fn test_configurable_interest_rate_and_default_term() {
     manager.set_interest_rate(&1_800);
     manager.set_default_term(&20_000);
 
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &20_000);
     let pending_loan = manager.get_loan(&loan_id);
@@ -725,8 +738,7 @@ fn test_legacy_zero_interest_config_falls_back_to_default() {
         &None,
     );
 
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17280);
     let pending_loan = manager.get_loan(&loan_id);
@@ -755,22 +767,22 @@ fn test_repayment_flow() {
 
     let token_client = TokenClient::new(&env, &token_id);
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
-    stellar_token.mint(&borrower, &10_000);
+    seed_pool(&env, &pool_client, &token_id, usdc(10_000));
+    stellar_token.mint(&borrower, &usdc(10_000));
 
-    let loan_id = manager.request_loan(&borrower, &1000, &17280);
+    let loan_id = manager.request_loan(&borrower, &usdc(1000), &17280);
     manager.approve_loan(&loan_id);
 
     env.ledger()
         .set_sequence_number(env.ledger().sequence() + 2_000);
 
-    manager.repay(&borrower, &loan_id, &500);
+    manager.repay(&borrower, &loan_id, &usdc(500));
 
     let loan = manager.get_loan(&loan_id);
     assert!(loan.principal_paid > 0);
     assert!(loan.interest_paid >= 0);
     assert_eq!(loan.status, LoanStatus::Approved);
-    assert_eq!(token_client.balance(&pool_client), 9_500);
+    assert_eq!(token_client.balance(&pool_client), usdc(9_500));
 
     let remaining_debt = loan.amount + loan.accrued_interest + loan.accrued_late_fee
         - loan.principal_paid
@@ -779,6 +791,16 @@ fn test_repayment_flow() {
     manager.repay(&borrower, &loan_id, &remaining_debt);
     let completed = manager.get_loan(&loan_id);
     assert_eq!(completed.status, LoanStatus::Repaid);
+    let pool = LendingPoolClient::new(&env, &pool_client);
+    let pool_stats = pool.get_pool_stats(&token_id);
+    assert_eq!(
+        pool_stats.total_managed_assets,
+        usdc(10_000) + completed.interest_paid + completed.late_fee_paid
+    );
+    assert_eq!(
+        pool_stats.total_yield_distributed,
+        completed.interest_paid + completed.late_fee_paid
+    );
 
     // Score updates include both partial and final repayment contributions.
     assert_eq!(nft_client.get_score(&borrower), 610);
@@ -803,7 +825,7 @@ fn test_partial_repayment_tracks_split_balances() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &2_000_000);
+    seed_pool(&env, &pool_client, &token_id, 2_000_000);
     stellar_token.mint(&borrower, &2_000_000);
 
     manager.set_max_loan_amount(&1_000_000);
@@ -843,7 +865,7 @@ fn test_minimum_repayment_amount_enforced() {
 
     let _history_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &10_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17280);
@@ -874,7 +896,7 @@ fn test_full_repayment_ignores_minimum_amount() {
 
     let _history_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &10_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17280);
@@ -930,7 +952,7 @@ fn test_small_repayment_does_not_change_score() {
     assert_eq!(nft_client.get_score(&borrower), 600);
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &10_000);
 
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
@@ -940,6 +962,31 @@ fn test_small_repayment_does_not_change_score() {
     manager.repay(&borrower, &loan_id, &99);
 
     assert_eq!(nft_client.get_score(&borrower), 600);
+}
+
+#[test]
+fn test_default_max_loan_is_50k_usdc_in_stroops() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+
+    let (manager, nft_client, _pool_client, _token_id, _token_admin) = setup_test(&env);
+    let borrower = Address::generate(&env);
+
+    let history_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+    nft_client.mint(
+        &borrower,
+        &600,
+        &history_hash,
+        &String::from_str(&env, "ipfs://QmTest"),
+        &create_test_commitment(&env, 1),
+        &None,
+    );
+
+    // One stroop over the default cap is rejected; the cap itself is allowed.
+    let over = manager.try_request_loan(&borrower, &(usdc(50_000) + 1), &17280);
+    assert_eq!(over, Err(Ok(LoanError::InvalidAmount)));
+    let at_cap = manager.try_request_loan(&borrower, &usdc(50_000), &17280);
+    assert!(at_cap.is_ok());
 }
 
 #[test]
@@ -961,10 +1008,10 @@ fn test_late_full_repayment_applies_score_penalty() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
-    stellar_token.mint(&borrower, &20_000);
+    seed_pool(&env, &pool_client, &token_id, usdc(20_000));
+    stellar_token.mint(&borrower, &usdc(20_000));
 
-    let loan_id = manager.request_loan(&borrower, &1000, &17280);
+    let loan_id = manager.request_loan(&borrower, &usdc(1000), &17280);
     manager.approve_loan(&loan_id);
 
     let due_date = manager.get_loan(&loan_id).due_date;
@@ -1024,8 +1071,7 @@ fn test_approve_already_approved_loan() {
         &None,
     );
 
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10000);
+    seed_pool(&env, &pool_client, &token_id, 10000);
 
     // Request and approve loan
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
@@ -1054,8 +1100,7 @@ fn test_approve_loan_insufficient_pool_liquidity() {
     );
 
     // Mint only 100 tokens into pool, but loan requests 1000
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &100);
+    seed_pool(&env, &pool_client, &token_id, 100);
 
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
     let result = manager.try_approve_loan(&loan_id);
@@ -1081,7 +1126,7 @@ fn test_borrower_max_active_loans_enforced_and_released_on_repay() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &50_000);
+    seed_pool(&env, &pool_client, &token_id, 50_000);
     stellar_token.mint(&borrower, &50_000);
 
     manager.set_max_loans_per_borrower(&2);
@@ -1119,8 +1164,7 @@ fn test_borrower_max_active_loans_blocks_new_requests() {
         &None,
     );
 
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &50_000);
+    seed_pool(&env, &pool_client, &token_id, 50_000);
 
     manager.set_max_loans_per_borrower(&2);
 
@@ -1151,8 +1195,7 @@ fn test_borrower_loan_list_is_bounded_by_configured_cap() {
         &None,
     );
 
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &50_000);
+    seed_pool(&env, &pool_client, &token_id, 50_000);
 
     manager.set_max_loans_per_borrower(&2);
 
@@ -1207,8 +1250,7 @@ fn test_check_default_success() {
         &None,
     );
 
-    let stellar_token = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
     manager.approve_loan(&loan_id);
@@ -1249,8 +1291,7 @@ fn test_check_default_not_past_due() {
         &None,
     );
 
-    let stellar_token = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
     manager.approve_loan(&loan_id);
@@ -1278,7 +1319,7 @@ fn test_check_default_already_repaid() {
     );
 
     let stellar_token = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &10_000);
 
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
@@ -1310,8 +1351,7 @@ fn test_check_default_respects_default_window() {
         &None,
     );
 
-    let stellar_token = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     manager.set_default_window_ledgers(&10_000);
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
@@ -1360,8 +1400,7 @@ fn test_check_defaults_batch() {
         &None,
     );
 
-    let stellar_token = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &100_000);
+    seed_pool(&env, &pool_client, &token_id, 100_000);
 
     let loan_id1 = manager.request_loan(&borrower1, &1000, &17280);
     let loan_id2 = manager.request_loan(&borrower2, &1000, &17280);
@@ -1425,8 +1464,7 @@ fn test_check_defaults_all_ineligible_returns_zero() {
         &None,
     );
 
-    let stellar_token = soroban_sdk::token::StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     let pending_loan_id = manager.request_loan(&borrower, &1000, &17280);
     let approved_loan_id = manager.request_loan(&borrower, &1000, &17280);
@@ -1466,7 +1504,7 @@ fn test_overdue_repayment_charges_late_fee() {
 
     let token_client = TokenClient::new(&env, &token_id);
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &10_000);
 
     manager.set_late_fee_rate(&500);
@@ -1509,7 +1547,7 @@ fn test_overdue_partial_repayment_still_reduces_principal() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &10_000);
 
     manager.set_late_fee_rate(&500);
@@ -1548,7 +1586,7 @@ fn test_deposit_collateral_moves_funds_from_borrower_to_contract() {
     // Regression test for #1353: deposit_collateral's token transfer was
     // reported as paying the borrower instead of taking collateral from
     // them. That direction is already correct on main (verified via git
-    // blame: fixed in a prior, unrelated commit — see PR description) — this
+    // blame: fixed in a prior, unrelated commit; see PR description). This
     // test pins the exact expected balance movement on both sides so any
     // future regression here is caught immediately: the borrower's balance
     // must decrease by the deposited amount and the contract's must
@@ -1571,7 +1609,7 @@ fn test_deposit_collateral_moves_funds_from_borrower_to_contract() {
 
     let token_client = TokenClient::new(&env, &token_id);
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
     stellar_token.mint(&borrower, &20_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17280);
@@ -1615,7 +1653,7 @@ fn test_deposit_collateral_and_auto_release_on_full_repayment() {
 
     let token_client = TokenClient::new(&env, &token_id);
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
     stellar_token.mint(&borrower, &20_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17280);
@@ -1661,7 +1699,7 @@ fn test_collateral_is_seized_on_default() {
 
     let token_client = TokenClient::new(&env, &token_id);
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
     stellar_token.mint(&borrower, &20_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17280);
@@ -1718,7 +1756,7 @@ fn test_collateral_is_seized_on_batch_default() {
 
     let token_client = TokenClient::new(&env, &token_id);
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &50_000);
+    seed_pool(&env, &pool_client, &token_id, 50_000);
     stellar_token.mint(&borrower1, &20_000);
     stellar_token.mint(&borrower2, &20_000);
 
@@ -1768,7 +1806,7 @@ fn test_liquidate_under_threshold_transfers_bonus_and_refund() {
 
     let token_client = TokenClient::new(&env, &token_id);
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
     stellar_token.mint(&borrower, &20_000);
 
     manager.set_liquidation_threshold(&14_500);
@@ -1822,7 +1860,7 @@ fn test_liquidate_rejects_healthy_collateral_ratio() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
     stellar_token.mint(&borrower, &20_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17_280);
@@ -1856,7 +1894,7 @@ fn test_liquidation_bonus_cap_enforced() {
 
     let token_client = TokenClient::new(&env, &token_id);
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
     stellar_token.mint(&borrower, &20_000);
 
     // Attempt to set bonus above 20% cap - should fail
@@ -2067,13 +2105,12 @@ fn test_pending_loans_count_against_cap() {
         &None,
     );
 
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     // Set cap to 2
     client.set_max_loans_per_borrower(&2);
 
-    // Request two loans (both pending) — should consume the full cap
+    // Request two loans (both pending); should consume the full cap
     let _loan_id_1 = client.request_loan(&borrower, &500, &17280);
     let _loan_id_2 = client.request_loan(&borrower, &500, &17280);
 
@@ -2106,8 +2143,7 @@ fn test_extend_loan_happy_path() {
     );
 
     // Mint tokens to pool
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     // Request and approve loan
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
@@ -2148,8 +2184,7 @@ fn test_extend_loan_wrong_borrower() {
         &create_test_commitment(&env, 1),
         &None,
     );
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     // Request and approve loan
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
@@ -2206,7 +2241,7 @@ fn test_extend_loan_rejected_for_repaid_loan() {
         &None,
     );
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &5_000);
 
     // Request, approve, and repay loan
@@ -2237,8 +2272,7 @@ fn test_extend_loan_rejected_for_defaulted_loan() {
         &create_test_commitment(&env, 1),
         &None,
     );
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     // Request and approve loan
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
@@ -2284,8 +2318,7 @@ fn test_extend_loan_rejected_for_zero_ledgers() {
         &create_test_commitment(&env, 1),
         &None,
     );
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     // Request and approve loan
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
@@ -2315,7 +2348,7 @@ fn test_extend_loan_max_extensions_limit() {
         &None,
     );
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &50_000);
+    seed_pool(&env, &pool_client, &token_id, 50_000);
     stellar_token.mint(&borrower, &50_000);
 
     // Request and approve loan
@@ -2355,7 +2388,7 @@ fn test_extend_loan_charges_fee() {
         &None,
     );
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &5_000);
     let token_client = TokenClient::new(&env, &token_id);
 
@@ -2395,7 +2428,7 @@ fn test_extend_loan_multiple_extensions() {
         &None,
     );
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &5_000);
 
     // Request and approve loan
@@ -2450,8 +2483,7 @@ fn test_oracle_rate_within_bounds_accepted() {
         &create_test_commitment(&env, 1),
         &None,
     );
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     // Deploy mock oracle returning 800 BPS (within default bounds 1..100_000)
     let oracle_id = env.register(MockRateOracle, ());
@@ -2461,7 +2493,7 @@ fn test_oracle_rate_within_bounds_accepted() {
     // Set the oracle on the loan manager
     manager.set_rate_oracle(&oracle_id);
 
-    // Request loan — the oracle branch should be taken
+    // Request loan: the oracle branch should be taken
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
     let loan = manager.get_loan(&loan_id);
 
@@ -2624,8 +2656,7 @@ fn test_oracle_rate_below_min_falls_back_to_default() {
         &create_test_commitment(&env, 1),
         &None,
     );
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     // Deploy mock oracle returning 100 BPS (below the min we will set)
     let oracle_id = env.register(MockRateOracle, ());
@@ -2635,7 +2666,7 @@ fn test_oracle_rate_below_min_falls_back_to_default() {
     manager.set_rate_oracle(&oracle_id);
     manager.set_min_rate_bps(&500);
 
-    // Request loan — oracle returns 100 which is below min_rate_bps=500
+    // Request loan: oracle returns 100 which is below min_rate_bps=500
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
     let loan = manager.get_loan(&loan_id);
 
@@ -2661,8 +2692,7 @@ fn test_oracle_rate_above_max_falls_back_to_default() {
         &create_test_commitment(&env, 1),
         &None,
     );
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     // Deploy mock oracle returning 5000 BPS (above the max we will set)
     let oracle_id = env.register(MockRateOracle, ());
@@ -2672,7 +2702,7 @@ fn test_oracle_rate_above_max_falls_back_to_default() {
     manager.set_rate_oracle(&oracle_id);
     manager.set_max_rate_bps(&2_000);
 
-    // Request loan — oracle returns 5000 which is above max_rate_bps=2000
+    // Request loan: oracle returns 5000 which is above max_rate_bps=2000
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
     let loan = manager.get_loan(&loan_id);
 
@@ -2698,8 +2728,7 @@ fn test_rate_bounds_persist_across_operations() {
         &create_test_commitment(&env, 1),
         &None,
     );
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     // Set custom rate bounds
     manager.set_min_rate_bps(&100);
@@ -2738,10 +2767,9 @@ fn test_interest_calculation_overflow_safety() {
         &None,
     );
 
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
     // Use a massive principal to test overflow safety
     let large_principal = 100_000_000_000_000_000_000_000_000_i128;
-    stellar_token.mint(&pool_client, &large_principal);
+    seed_pool(&env, &pool_client, &token_id, large_principal);
 
     // Increase interest rate so the accrual math hits overflow protection well
     // before the repayment window ends.
@@ -2789,7 +2817,7 @@ fn test_liquidate_with_collateral_shortfall_has_no_refund() {
 
     let token_client = TokenClient::new(&env, &token_id);
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
     stellar_token.mint(&borrower, &20_000);
 
     manager.set_liquidation_threshold(&15_000);
@@ -2837,7 +2865,7 @@ fn test_liquidate_rejects_repaid_loan() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
     stellar_token.mint(&borrower, &20_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17_280);
@@ -2873,7 +2901,7 @@ fn test_liquidate_emits_loan_liquidated_event_with_expected_amounts() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
     stellar_token.mint(&borrower, &20_000);
 
     manager.set_liquidation_threshold(&14_500);
@@ -2912,7 +2940,7 @@ fn test_late_fee_cap_at_total_debt_limit() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &10_000);
 
     let loan_id = manager.request_loan(&borrower, &1000, &1000);
@@ -2949,7 +2977,7 @@ fn test_late_fees_stop_accruing_when_principal_paid() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &10_000);
 
     let loan_id = manager.request_loan(&borrower, &1000, &1000);
@@ -2989,7 +3017,7 @@ fn test_refinance_loan_increases_principal_draws_from_pool() {
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
     let token_client = TokenClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &50_000);
+    seed_pool(&env, &pool_client, &token_id, 50_000);
 
     // Approve a 1_000-unit loan, then set collateral high enough for refinance.
     let loan_id = manager.request_loan(&borrower, &1_000, &17_280);
@@ -3007,7 +3035,7 @@ fn test_refinance_loan_increases_principal_draws_from_pool() {
     let borrower_balance_before = token_client.balance(&borrower);
     let pool_balance_before = token_client.balance(&pool_client);
 
-    // Refinance to 2_000 — pool should disburse the extra 1_000.
+    // Refinance to 2_000: pool should disburse the extra 1_000.
     manager.refinance_loan(&loan_id, &2_000, &17_280);
 
     let loan = manager.get_loan(&loan_id);
@@ -3029,7 +3057,7 @@ fn test_refinance_loan_increases_principal_draws_from_pool() {
 fn test_refinance_loan_increasing_amount_increases_total_outstanding() {
     // Regression test for #1354: refinancing to a larger amount (borrowing
     // more) must INCREASE total_outstanding by the borrowed delta, not
-    // decrease it — a flipped sign here would let a borrower's recorded debt
+    // decrease it; a flipped sign here would let a borrower's recorded debt
     // shrink while the pool actually pays them more.
     let env = Env::default();
     env.mock_all_auths_allowing_non_root_auth();
@@ -3048,7 +3076,7 @@ fn test_refinance_loan_increasing_amount_increases_total_outstanding() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &50_000);
+    seed_pool(&env, &pool_client, &token_id, 50_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17_280);
     manager.approve_loan(&loan_id);
@@ -3063,7 +3091,7 @@ fn test_refinance_loan_increasing_amount_increases_total_outstanding() {
 
     let total_outstanding_before = manager.get_total_outstanding(&token_id);
 
-    // Refinance from 1_000 to 2_000 — total_outstanding must grow by 1_000.
+    // Refinance from 1_000 to 2_000: total_outstanding must grow by 1_000.
     manager.refinance_loan(&loan_id, &2_000, &17_280);
 
     let total_outstanding_after = manager.get_total_outstanding(&token_id);
@@ -3090,7 +3118,7 @@ fn test_refinance_loan_decreases_principal_returns_excess_to_pool() {
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
     let token_client = TokenClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &50_000);
+    seed_pool(&env, &pool_client, &token_id, 50_000);
     // Give borrower tokens so they can return the excess principal.
     stellar_token.mint(&borrower, &10_000);
 
@@ -3108,7 +3136,7 @@ fn test_refinance_loan_decreases_principal_returns_excess_to_pool() {
 
     let pool_balance_before = token_client.balance(&pool_client);
 
-    // Refinance down to 1_000 — borrower returns 1_000 to the pool.
+    // Refinance down to 1_000: borrower returns 1_000 to the pool.
     manager.refinance_loan(&loan_id, &1_000, &17_280);
 
     let loan = manager.get_loan(&loan_id);
@@ -3143,7 +3171,7 @@ fn test_refinance_loan_decreasing_amount_decreases_total_outstanding() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &50_000);
+    seed_pool(&env, &pool_client, &token_id, 50_000);
     stellar_token.mint(&borrower, &10_000);
 
     let loan_id = manager.request_loan(&borrower, &2_000, &17_280);
@@ -3159,7 +3187,7 @@ fn test_refinance_loan_decreasing_amount_decreases_total_outstanding() {
 
     let total_outstanding_before = manager.get_total_outstanding(&token_id);
 
-    // Refinance down from 2_000 to 1_000 — total_outstanding must shrink by 1_000.
+    // Refinance down from 2_000 to 1_000: total_outstanding must shrink by 1_000.
     manager.refinance_loan(&loan_id, &1_000, &17_280);
 
     let total_outstanding_after = manager.get_total_outstanding(&token_id);
@@ -3184,8 +3212,7 @@ fn test_refinance_loan_fails_when_score_drops_below_minimum() {
         &None,
     );
 
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &50_000);
+    seed_pool(&env, &pool_client, &token_id, 50_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17_280);
     manager.approve_loan(&loan_id);
@@ -3253,8 +3280,7 @@ fn test_pause_blocks_approve_loan() {
         &None,
     );
 
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     // Request loan before pausing
     let loan_id = manager.request_loan(&borrower, &1000, &17280);
@@ -3287,7 +3313,7 @@ fn test_pause_blocks_repay() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &2_000);
 
     // Request and approve loan before pausing
@@ -3385,7 +3411,7 @@ fn test_collateral_release_works_while_paused() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &2_000);
 
     // Request, approve, and fully repay loan before pausing
@@ -3434,7 +3460,7 @@ fn test_purge_repaid_loan_removes_storage() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &10_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17280);
@@ -3553,8 +3579,7 @@ fn test_purge_approved_loan_rejected() {
         &None,
     );
 
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17280);
     manager.approve_loan(&loan_id);
@@ -3593,7 +3618,7 @@ fn test_purge_emits_loan_purged_event() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &10_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17280);
@@ -3657,7 +3682,7 @@ fn test_get_total_outstanding_tracks_approve_and_repay() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
     stellar_token.mint(&borrower, &10_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17_280);
@@ -3694,8 +3719,7 @@ fn test_get_total_outstanding_decreases_on_check_default() {
         &None,
     );
 
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &10_000);
+    seed_pool(&env, &pool_client, &token_id, 10_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17_280);
     manager.approve_loan(&loan_id);
@@ -3729,7 +3753,7 @@ fn test_is_liquidatable_healthy_loan() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
     stellar_token.mint(&borrower, &20_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17_280);
@@ -3758,7 +3782,7 @@ fn test_is_liquidatable_under_threshold() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
     stellar_token.mint(&borrower, &20_000);
 
     manager.set_liquidation_threshold(&14_500);
@@ -3789,7 +3813,7 @@ fn test_is_liquidatable_exactly_at_threshold() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
     stellar_token.mint(&borrower, &20_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17_280);
@@ -3818,8 +3842,7 @@ fn test_is_liquidatable_zero_collateral() {
         &None,
     );
 
-    let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
 
     let loan_id = manager.request_loan(&borrower, &1_000, &17_280);
     manager.approve_loan(&loan_id);
@@ -3868,7 +3891,7 @@ fn test_get_loan_health_matches_liquidation_state() {
     );
 
     let stellar_token = StellarAssetClient::new(&env, &token_id);
-    stellar_token.mint(&pool_client, &20_000);
+    seed_pool(&env, &pool_client, &token_id, 20_000);
     stellar_token.mint(&borrower, &20_000);
 
     manager.set_liquidation_threshold(&14_500);
